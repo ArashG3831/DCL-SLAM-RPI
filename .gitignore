@@ -1,0 +1,52 @@
+# Python caches and local test state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ROS 2 generated workspaces
+webots_ws/build/
+webots_ws/install/
+webots_ws/log/
+nav2_ws/build/
+nav2_ws/install/
+nav2_ws/log/
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# Historical/temporary source backups
+*.backup*
+*.bak*
+*_WORKING_*
+*working*
+
+# Runtime logs, captures, benchmark output, and large generated artifacts
+motor_safety_logs/
+pid_bench_logs/
+robot_map_tests/
+robot1_maps/
+*.csv
+*.npz
+*.tar.gz
+*.png
+room_raw.*
+room_median.*
+roomtest_raw.*
+roomtest_median.*
+
+# Local machine state and credentials
+.bash_history
+.cache/
+.config/
+.local/
+.ros/
+.ssh/
+.codex/
+.venvs/
+.lgd-nfy*
+
+# Root-level exploratory/runtime artifacts
+/explore_inventory_*.txt
+/nav2_history_and_settings.txt
+/run_*
+/session_*
