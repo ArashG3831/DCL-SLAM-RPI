@@ -43,17 +43,45 @@ range representation.
 The ROS smoke test uses a pseudo-terminal and an isolated ROS domain. It does
 not open `/dev/ttyUSB0`, start the Python driver, or start the motor node.
 
+## Authorized hardware validation
+
+The following tests were completed in isolated ROS domains while the normal
+phone-supervised stack was stopped. Python remained the reference/default
+backend throughout.
+
+| Validation | Result |
+|---|---|
+| C++ motor no-motion GPIO claim/shutdown | PASS; safe initialization and motor-zero shutdown |
+| C++ motor lifted-wheel stress | PASS; 180 s at -50 RPM, 3,621 odometry samples, zero safety faults |
+| Python motor lifted-wheel reference | PASS; 180 s at -50 RPM, 3,600 odometry samples, zero safety faults |
+| C++ D500 real serial | PASS; 20 s, 211 scans, 720 bins, p95 interval 100.9 ms, CRC/parser/handoff errors 0 |
+| Python D500 real serial reference | PASS; 20 s, 200 scans, 720 bins, p95 interval 104.3 ms |
+| Four motor+D500 backend combinations | PASS; each 60 s lifted-wheel run, valid `/odom` and `/scan`, zero safety faults |
+
+### Measured native-port performance
+
+The one-process motor benchmark measured Python at 45.8% mean of one CPU core
+and C++ at 21.3% in the 180-second runs. The comparable D500-only benchmark
+measured Python at 17.6% and C++ at 3.5% of one core over 20 seconds. These are
+process CPU values, not whole-Pi percentages; each result also retains the
+whole-system and per-core samples in `/tmp/r1_*` and the generated benchmark
+JSON files.
+
+In the four-way 60-second matrix, the native/native combination measured about
+21.7% motor plus 4.1% D500 process CPU, versus about 52.2% plus 35.6% for the
+Python/Python combination. Scan timing stayed near 100 ms for native D500 and
+near 103–105 ms for the Python reference. These runs did not change scan rate,
+bin count, control rate, map resolution, calibration, or safety behavior.
+
 ## Remaining validation
 
-The following require an explicitly authorized hardware window:
-
-1. Physical D500-only A/B test. The current Python D500 process owns the real
-   serial device, so it must be coordinated and stopped/restarted cleanly.
-2. Motor no-motion GPIO initialization/claim test, followed by a stationary
-   encoder observation test.
-3. Controlled lifted-wheel motor parity test against Python.
-4. Four runtime CPU benchmark configurations after safety parity is accepted.
-5. Production-default switch, only after those results are reviewed.
+1. Review the native encoder-count/edge diagnostics during a longer production
+   workload containing the final SLAM and thesis nodes.
+2. If desired, repeat the matrix with the final conservative scan-matching ON
+   configuration once that configuration is deliberately selected; no SLAM
+   parameters were changed by this port.
+3. Keep the C++ backend opt-in until the physical results are reviewed and a
+   separate production-default switch is approved.
 
 No production launcher, Python node, calibration, safety threshold, SLAM
 parameter, lidar geometry, or map resolution was changed in this port.

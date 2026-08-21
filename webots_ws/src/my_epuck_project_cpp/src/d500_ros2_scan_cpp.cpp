@@ -124,13 +124,13 @@ private:
           std::lock_guard<std::mutex> handoff(handoff_mutex_);
           if (latest_scan_) ++handoff_drops_;
           latest_scan_ = std::move(scan);
-          }
         }
-      } else if (n < 0 && errno != EINTR && errno != EAGAIN) {
+      } else if (n < 0 && !stopping_.load() && errno != EINTR && errno != EAGAIN) {
         ++serial_error_count_;
         RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
                               "D500 serial read failed: %s", std::strerror(errno));
       }
+    }
   }
 
   static builtin_interfaces::msg::Time ros_time_from_wall(double seconds)
@@ -190,7 +190,7 @@ private:
       "D500_CPP scans=%zu published=%zu packets=%zu acq_last=%.1fms acq_max=%.1fms "
       "pub_gap_max=%.1fms scan_age=%.1fms rpm=%.1f crc=%zu parser=%zu "
       "handoff_drops=%zu serial_errors=%zu",
-      completed, published_scan_count_, packets, last_scan_time * 1000.0,
+      completed, published_scan_count_.load(), packets, last_scan_time * 1000.0,
       max_scan_time * 1000.0, max_publish_gap_ * 1000.0, last_scan_age_ * 1000.0,
       rpm, crc, parser_errors, handoff_drops, serial_error_count_.load());
   }

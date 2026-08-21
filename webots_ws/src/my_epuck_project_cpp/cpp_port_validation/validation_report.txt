@@ -1,0 +1,41 @@
+Native hardware-port validation summary
+=======================================
+
+Reference baseline: commit 3be3371.
+Current backend policy: Python remains the production default; C++ is opt-in.
+
+Automated validation
+--------------------
+* C++ CTest: 4/4 passed (motor core, D500 parser, and both Python/C++ golden tests).
+* Relevant existing Python tests: 29 passed.
+* Motor golden vectors: passed; counts, valid/invalid transitions, RPM, PI output,
+  and odometry pose matched for five deterministic control steps.
+* D500 golden stream: passed; 2 packets, 1 completed scan, every one of 720 bins.
+* Pseudo-terminal ROS D500 smoke test: passed; frame d500_lidar, 720 bins.
+* Backend selector and Python syntax checks: passed.
+* git diff --check: passed.
+
+Real hardware validation
+------------------------
+* C++ motor no-motion GPIO claim: passed; safe startup/shutdown, zero transitions,
+  zero invalid transitions, zero deadline misses in the final check.
+* C++ motor lifted-wheel stress: passed for 180 s at -50 RPM; 3,621 odometry samples,
+  no safety fault. Mean process CPU was 21.337% of one core; p95 29.994%.
+* Python motor reference: passed for 180 s at -50 RPM; 3,600 odometry samples,
+  no safety fault. Mean process CPU was 45.781% of one core; p95 56.618%.
+* C++ D500: passed on the real serial device for 20 s; 211 scans, 720 bins,
+  p95 interval 100.884 ms, no CRC/parser/handoff errors.
+* Python D500 reference: passed for 20 s; 200 scans, 720 bins, p95 interval
+  104.332 ms.
+* Four 60 s motor+D500 lifted-wheel combinations all passed with valid odometry,
+  valid scans, and zero motor safety faults.
+
+Interpretation
+--------------
+The native ports materially reduce the measured hardware-process CPU demand while
+preserving the tested scan geometry, scan rate, motor command profile, encoder
+behavior, and safety outcome. The C++ motor run recorded one isolated 51.373 ms
+deadline excursion; this is a diagnostic miss, not a safety event, and remains
+far below the unchanged 350 ms safety timeout. The production default was not
+switched. A final thesis-stack benchmark and any default switch remain separate
+review steps.

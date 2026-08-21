@@ -65,7 +65,18 @@ install(TARGETS motor_core d500_core real_diffdrive_node_cpp d500_ros2_scan_cpp
 )
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY docs/ DESTINATION share/${PROJECT_NAME}/docs)
+install(DIRECTORY cpp_port_validation/ DESTINATION share/${PROJECT_NAME}/cpp_port_validation)
 install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch)
+install(PROGRAMS
+  tools/capture_d500_bytes.py
+  tools/cpp_port_benchmark.py
+  tools/d500_cpp_live_benchmark.py
+  tools/d500_cpp_ros_smoke.py
+  tools/generate_d500_golden.py
+  tools/generate_motor_golden.py
+  tools/hardware_pair_benchmark.py
+  tools/motor_backend_benchmark.py
+  DESTINATION share/${PROJECT_NAME}/tools)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)

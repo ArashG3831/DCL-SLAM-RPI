@@ -224,6 +224,8 @@ private:
   {
     std::deque<double> periods, execs, ages;
     std::size_t misses, unknown;
+    const auto left = left_encoder_.snapshot();
+    const auto right = right_encoder_.snapshot();
     {
       std::lock_guard<std::mutex> lock(timing_mutex_);
       periods = control_periods_;
@@ -238,12 +240,24 @@ private:
     RCLCPP_INFO(get_logger(),
       "MOTOR_CPP timing period_ms[p50=%.3f p95=%.3f p99=%.3f max=%.3f] "
       "exec_ms[p50=%.3f p95=%.3f p99=%.3f max=%.3f] deadline_misses=%zu "
-      "encoder_age_ms[max=%.3f] unknown_age_cycles=%zu",
+      "encoder_age_ms[max=%.3f] unknown_age_cycles=%zu "
+      "L[count=%lld valid=%llu invalid=%llu A=%llu B=%llu] "
+      "R[count=%lld valid=%llu invalid=%llu A=%llu B=%llu]",
       percentile(periods, 50.0) * 1000.0, percentile(periods, 95.0) * 1000.0,
       percentile(periods, 99.0) * 1000.0, max_or_zero(periods) * 1000.0,
       percentile(execs, 50.0) * 1000.0, percentile(execs, 95.0) * 1000.0,
       percentile(execs, 99.0) * 1000.0, max_or_zero(execs) * 1000.0, misses,
-      max_or_zero(ages) * 1000.0, unknown);
+      max_or_zero(ages) * 1000.0, unknown,
+      static_cast<long long>(left.count),
+      static_cast<unsigned long long>(left.valid_transition_count),
+      static_cast<unsigned long long>(left.invalid_transition_count),
+      static_cast<unsigned long long>(left.a_edge_count),
+      static_cast<unsigned long long>(left.b_edge_count),
+      static_cast<long long>(right.count),
+      static_cast<unsigned long long>(right.valid_transition_count),
+      static_cast<unsigned long long>(right.invalid_transition_count),
+      static_cast<unsigned long long>(right.a_edge_count),
+      static_cast<unsigned long long>(right.b_edge_count));
   }
 
   void publish_output(const ControlOutput & output)

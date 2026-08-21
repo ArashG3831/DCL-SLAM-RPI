@@ -11,9 +11,21 @@
     "git_diff_check": "PASS"
   },
   "hardware_validation": {
-    "d500_real_serial": "PENDING_EXPLICIT_TEST_WINDOW",
-    "motor_gpio": "PENDING_EXPLICIT_MOTOR_PERMISSION",
-    "cpu_matrix": "PENDING_HARDWARE_PARITY"
+    "d500_real_serial": {
+      "cpp": {"status": "PASS", "duration_s": 20, "scans": 211, "bins": 720, "interval_p95_s": 0.100884, "crc_errors": 0, "parser_errors": 0, "handoff_drops": 0},
+      "python_reference": {"status": "PASS", "duration_s": 20, "scans": 200, "bins": 720, "interval_p95_s": 0.104332}
+    },
+    "motor_gpio": {
+      "cpp_nomotion": "PASS",
+      "cpp_lifted_180s": {"status": "PASS", "odom_samples": 3621, "safety_faults": 0, "process_cpu_mean_percent_one_core": 21.337},
+      "python_lifted_180s": {"status": "PASS", "odom_samples": 3600, "safety_faults": 0, "process_cpu_mean_percent_one_core": 45.781}
+    },
+    "cpu_matrix_60s": {
+      "python_python": {"status": "PASS", "motor_cpu_mean": 52.235, "d500_cpu_mean": 35.586, "whole_system_active_mean": 43.491},
+      "cpp_python": {"status": "PASS", "motor_cpu_mean": 15.934, "d500_cpu_mean": 30.319, "whole_system_active_mean": 17.484},
+      "python_cpp": {"status": "PASS", "motor_cpu_mean": 48.926, "d500_cpu_mean": 4.286, "whole_system_active_mean": 36.192},
+      "cpp_cpp": {"status": "PASS", "motor_cpu_mean": 21.728, "d500_cpu_mean": 4.095, "whole_system_active_mean": 15.995}
+    }
   },
   "frozen_values": {
     "wheel_radius_m": 0.035,

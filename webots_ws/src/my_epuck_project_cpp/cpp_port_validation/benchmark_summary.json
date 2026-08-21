@@ -1,0 +1,27 @@
+{
+  "baseline_commit": "3be3371",
+  "production_defaults": {"motor": "python", "d500": "python"},
+  "frozen_calibration": {
+    "wheel_radius_m": 0.035,
+    "encoder_cpr": 4606,
+    "wheel_separation_cmd_m": 0.22235,
+    "wheel_separation_odom_m": 0.22235,
+    "lidar_bins": 720,
+    "map_resolution_m": 0.03
+  },
+  "real_d500_20s": {
+    "python": {"status": "PASS", "scans": 200, "bins": 720, "interval_p95_s": 0.104332, "interval_max_s": 0.105293},
+    "cpp": {"status": "PASS", "scans": 211, "bins": 720, "interval_p95_s": 0.100884, "interval_max_s": 0.101107, "crc_errors": 0, "parser_errors": 0, "handoff_drops": 0}
+  },
+  "real_motor_180s_lifted": {
+    "python": {"status": "PASS", "odom_samples": 3600, "safety_faults": 0, "process_cpu_mean_percent_one_core": 45.781, "process_cpu_p95_percent_one_core": 56.618, "temperature_max_c": 59.887},
+    "cpp": {"status": "PASS", "odom_samples": 3621, "safety_faults": 0, "process_cpu_mean_percent_one_core": 21.337, "process_cpu_p95_percent_one_core": 29.994, "temperature_max_c": 54.530, "deadline_misses": 1}
+  },
+  "motor_d500_60s_lifted": {
+    "python_python": {"status": "PASS", "motor_cpu_mean": 52.235, "d500_cpu_mean": 35.586, "whole_system_active_mean": 43.491, "scan_interval_p95_s": 0.108290, "safety_faults": 0},
+    "cpp_python": {"status": "PASS", "motor_cpu_mean": 15.934, "d500_cpu_mean": 30.319, "whole_system_active_mean": 17.484, "scan_interval_p95_s": 0.106502, "safety_faults": 0},
+    "python_cpp": {"status": "PASS", "motor_cpu_mean": 48.926, "d500_cpu_mean": 4.286, "whole_system_active_mean": 36.192, "scan_interval_p95_s": 0.100872, "safety_faults": 0},
+    "cpp_cpp": {"status": "PASS", "motor_cpu_mean": 21.728, "d500_cpu_mean": 4.095, "whole_system_active_mean": 15.995, "scan_interval_p95_s": 0.100852, "safety_faults": 0}
+  },
+  "offline_regression": {"cpp_ctest": {"tests": 4, "failures": 0}, "python_relevant_tests": {"tests": 29, "failures": 0}, "git_diff_check": "PASS"}
+}
