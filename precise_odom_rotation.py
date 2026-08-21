@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Actuator-aware, closed-loop in-place rotation using calibrated /odom.
+"""Profiled, closed-loop in-place rotation using calibrated /odom.
 
 This is a test utility. It does not alter the production motor node, wheel
-parameters, encoder signs, or lidar configuration. The outer loop controls
-body angular velocity; the production node continues to close the individual
-wheel-speed PI loops.
+parameters, encoder signs, or lidar configuration. The outer loop generates
+a cruise/braking velocity profile from unwrapped /odom; the production node
+continues to close the individual wheel-speed PI loops.
 """
 
 import argparse
@@ -23,13 +23,20 @@ from rclpy.node import Node
 
 CONTROL_PERIOD_S = 0.05  # Match real_diffdrive_node.py CONTROL_DT.
 MIN_EFFECTIVE_OMEGA = 0.40  # Production motor deadband maps below this upward.
-MAX_OMEGA = 0.50
-KP = 1.20
-KD = 0.35
+# Match the phone controller's current maximum spin command.
+MAX_OMEGA = 0.75
 STOP_LATENCY_S = 0.08
 STOP_DECEL_RAD_S2 = 1.80
-STOP_MARGIN_RAD = math.radians(0.35)
-TRIM_SETTLE_S = 0.55
+STOP_SPEED_TOLERANCE_RAD_S = 0.05
+BRAKE_BUFFER_RAD = math.radians(60.0)
+BRAKE_COMMAND_DECEL_RAD_S2 = 0.65
+# Do not add a post-stop nudge.  The controller must finish with one
+# continuous deceleration followed by zero, like a normal closed-loop stop.
+# Empirical compensation for the measured odom distance travelled after the
+# zero command reaches the production motor node.  This belongs only to this
+# standalone rotation controller; it is not a wheel-separation, wheel-radius,
+# CPR, lidar, or physical-calibration value.
+STOP_MARGIN_RAD = math.radians(1.65)
 
 
 def wrap_pi(angle):
@@ -43,30 +50,62 @@ def yaw_from_quaternion(q):
     )
 
 
-def coast_distance(angular_speed):
+def coast_distance(angular_speed, margin_rad=STOP_MARGIN_RAD):
     """Conservative distance travelled after issuing zero command."""
     speed = abs(angular_speed)
     return (
         speed * STOP_LATENCY_S
         + (speed * speed) / (2.0 * STOP_DECEL_RAD_S2)
-        + STOP_MARGIN_RAD
+        + margin_rad
     )
 
 
-def pid_command(error, measured_omega, direction):
-    """Actuator-aware PD/PID velocity command in the requested direction.
+def profile_command(
+    remaining,
+    measured_omega,
+    direction,
+    previous_command=None,
+    stop_margin_rad=STOP_MARGIN_RAD,
+    max_omega=MAX_OMEGA,
+):
+    """Return (command, phase) for a bounded cruise/braking profile.
 
-    The motor node intentionally has a real deadband. A mathematically tiny
-    angular command would therefore be silently converted to its minimum
-    usable wheel speed. We keep the continuous PD law, then quantize only the
-    nonzero output to the known minimum actuator command.
+    The command remains at the requested cruise speed until a deliberately
+    calculated braking window. Inside that window its *command* is ramped
+    down at a bounded rate, rather than jumping from cruise to the motor
+    deadband floor. The motor node's minimum usable command is respected, and
+    the command becomes exactly zero once the measured-speed coast distance
+    reaches the target. There is deliberately no integral term and no
+    post-stop correction pulse.
     """
-    signed_error = direction * error
-    signed_speed = direction * measured_omega
-    raw = KP * signed_error - KD * signed_speed
-    if raw <= 0.0:
-        return 0.0
-    return direction * min(MAX_OMEGA, max(MIN_EFFECTIVE_OMEGA, raw))
+    remaining = float(remaining)
+    if remaining <= 0.0:
+        return 0.0, "overshot", 0.0
+
+    command_magnitude = (
+        max_omega
+        if previous_command is None
+        else min(max_omega, max(MIN_EFFECTIVE_OMEGA, abs(float(previous_command))))
+    )
+
+    speed = max(0.0, direction * float(measured_omega))
+
+    braking_start = coast_distance(max_omega, stop_margin_rad) + BRAKE_BUFFER_RAD
+    if (
+        remaining <= coast_distance(speed, stop_margin_rad)
+        and command_magnitude <= MIN_EFFECTIVE_OMEGA + STOP_SPEED_TOLERANCE_RAD_S
+        and speed <= MIN_EFFECTIVE_OMEGA + STOP_SPEED_TOLERANCE_RAD_S
+    ):
+        return 0.0, "stop", 0.0
+
+    if remaining > braking_start:
+        return direction * max_omega, "cruise", max_omega
+
+    command_magnitude = max(
+        MIN_EFFECTIVE_OMEGA,
+        command_magnitude - BRAKE_COMMAND_DECEL_RAD_S2 * CONTROL_PERIOD_S,
+    )
+    return direction * command_magnitude, "braking", command_magnitude
 
 
 class OdomFeedback(Node):
@@ -82,6 +121,7 @@ class OdomFeedback(Node):
         self.pose_y = 0.0
         self.angular_velocity = 0.0
         self.last_odom_monotonic = 0.0
+        self.odom_sequence = 0
         self.fault = None
         self.odom_history = deque(maxlen=4000)
         self.capture_scans = False
@@ -100,8 +140,16 @@ class OdomFeedback(Node):
         self.angular_velocity = float(msg.twist.twist.angular.z)
         receive_time = time.monotonic()
         self.last_odom_monotonic = receive_time
+        self.odom_sequence += 1
         stamp_ns = int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
-        self.odom_history.append((stamp_ns, receive_time, self.pose_x, self.pose_y, self.unwrapped_yaw))
+        self.odom_history.append((
+            stamp_ns,
+            receive_time,
+            self.pose_x,
+            self.pose_y,
+            self.unwrapped_yaw,
+            self.angular_velocity,
+        ))
 
     def _scan_cb(self, msg):
         if not self.capture_scans or not self.odom_history:
@@ -124,6 +172,9 @@ class OdomFeedback(Node):
             "pose_x": float(sample[2]),
             "pose_y": float(sample[3]),
             "pose_yaw": float(sample[4]),
+            "odom_angular_velocity": float(sample[5]),
+            "scan_time": float(msg.scan_time),
+            "time_increment": float(msg.time_increment),
         })
 
     def _fault_cb(self, msg):
@@ -150,17 +201,15 @@ def wait_for_odom(node, timeout_s):
     return False
 
 
-def send_for_period(node, omega, duration_s):
-    """Publish at the production control period, then return only stopped."""
-    deadline = time.monotonic() + duration_s
-    while rclpy.ok() and time.monotonic() < deadline:
-        node.publish_omega(omega)
-        rclpy.spin_once(node, timeout_sec=0.01)
-        time.sleep(max(0.0, CONTROL_PERIOD_S - 0.01))
-    node.publish_omega(0.0)
-
-
-def run_rotation(node, angle_rad, direction, tolerance_rad, capture_scans=False):
+def run_rotation(
+    node,
+    angle_rad,
+    direction,
+    tolerance_rad,
+    max_omega=MAX_OMEGA,
+    stop_margin_rad=STOP_MARGIN_RAD,
+    capture_scans=False,
+):
     if not wait_for_odom(node, 4.0):
         raise RuntimeError("No /odom received")
     node.publish_omega(0.0)
@@ -173,19 +222,43 @@ def run_rotation(node, angle_rad, direction, tolerance_rad, capture_scans=False)
     if capture_scans:
         node.scan_records.clear()
         node.capture_scans = True
-        print("LaserScan capture: enabled", flush=True)
+        warmup_deadline = time.monotonic() + 4.0
+        while (
+            rclpy.ok()
+            and len(node.scan_records) < 3
+            and time.monotonic() < warmup_deadline
+        ):
+            rclpy.spin_once(node, timeout_sec=0.05)
+        if len(node.scan_records) < 3:
+            node.capture_scans = False
+            raise RuntimeError(
+                "LaserScan warm-up failed: fewer than 3 live scans received"
+            )
+        node.scan_records.clear()
+        print("LaserScan capture: enabled after 3-scan warm-up", flush=True)
     print(f"Initial unwrapped yaw: {math.degrees(start):+.4f} deg", flush=True)
     print(f"Target rotation: {math.degrees(angle_rad):.4f} deg", flush=True)
+    print(f"Closed-loop speed ceiling: {max_omega:.3f} rad/s", flush=True)
+    print(f"Stop-margin compensation: {math.degrees(stop_margin_rad):.3f} deg", flush=True)
+    print(f"Acceptance tolerance: {math.degrees(tolerance_rad):.4f} deg", flush=True)
 
-    next_tick = time.monotonic()
-    phase = "closed_loop"
+    # Drive the outer position controller from fresh /odom samples rather than
+    # from an unrelated wall-clock timer.  The production motor loop remains
+    # 20 Hz; this only removes an avoidable one-cycle command reaction delay in
+    # the standalone test controller.
+    last_odom_sequence = node.odom_sequence
+    phase = "cruise"
+    command_magnitude = max_omega
     while rclpy.ok():
+        while rclpy.ok() and node.odom_sequence == last_odom_sequence:
+            rclpy.spin_once(node, timeout_sec=CONTROL_PERIOD_S)
+            if time.monotonic() - node.last_odom_monotonic > 0.30:
+                node.publish_omega(0.0)
+                raise RuntimeError("/odom became stale; motion aborted")
+        if not rclpy.ok():
+            break
+        last_odom_sequence = node.odom_sequence
         now = time.monotonic()
-        if now < next_tick:
-            rclpy.spin_once(node, timeout_sec=min(0.01, next_tick - now))
-            continue
-        next_tick += CONTROL_PERIOD_S
-        rclpy.spin_once(node, timeout_sec=0.0)
         if node.fault:
             node.publish_omega(0.0)
             raise RuntimeError(f"Motor safety fault: {node.fault}")
@@ -194,10 +267,18 @@ def run_rotation(node, angle_rad, direction, tolerance_rad, capture_scans=False)
             raise RuntimeError("/odom became stale; motion aborted")
 
         error = target - node.unwrapped_yaw
-        signed_speed = direction * node.angular_velocity
-        if signed_speed >= 0.0 and error * direction <= coast_distance(node.angular_velocity):
+        remaining = direction * error
+        cmd, next_phase, command_magnitude = profile_command(
+            remaining,
+            node.angular_velocity,
+            direction,
+            previous_command=command_magnitude,
+            stop_margin_rad=stop_margin_rad,
+            max_omega=max_omega,
+        )
+        if next_phase in {"stop", "overshot"}:
             node.publish_omega(0.0)
-            phase = "coast_stop"
+            phase = next_phase
             print(
                 f"Stop threshold reached: progress={math.degrees(node.unwrapped_yaw-start):.4f} deg "
                 f"remaining={math.degrees(error):+.4f} deg "
@@ -206,7 +287,7 @@ def run_rotation(node, angle_rad, direction, tolerance_rad, capture_scans=False)
             )
             break
 
-        cmd = pid_command(error, node.angular_velocity, direction)
+        phase = next_phase
         node.publish_omega(cmd)
         if int(now * 2) != int((now - CONTROL_PERIOD_S) * 2):
             print(
@@ -219,28 +300,9 @@ def run_rotation(node, angle_rad, direction, tolerance_rad, capture_scans=False)
 
     node.publish_omega(0.0)
     spin_for(node, 1.2)
-
-    # The actuator is quantized by the motor-node deadband, so the final
-    # correction is a bounded, measured pulse loop rather than a fake
-    # sub-deadband command. Every pulse spans complete 50-ms motor updates.
-    for index in range(12):
-        error = target - node.unwrapped_yaw
-        error_deg = math.degrees(error)
-        if abs(error) <= tolerance_rad:
-            break
-        trim_direction = 1.0 if error > 0.0 else -1.0
-        # Use a 60--100 ms pulse. Below 50 ms the production motor timer may
-        # never apply the target before the zero command arrives.
-        pulse_s = max(0.060, min(0.100, abs(error) / 0.30))
-        print(
-            f"Trim {index + 1}: error={error_deg:+.4f} deg, "
-            f"command={trim_direction * MIN_EFFECTIVE_OMEGA:+.3f}, "
-            f"duration={pulse_s * 1000:.0f} ms",
-            flush=True,
-        )
-        send_for_period(node, trim_direction * MIN_EFFECTIVE_OMEGA, pulse_s)
-        spin_for(node, TRIM_SETTLE_S)
-
+    # Deliberately no trim pulse here.  If the continuous stop lands outside
+    # tolerance, the test reports FAIL so the stop model/controller can be
+    # improved explicitly rather than hiding the error with a visible nudge.
     node.publish_omega(0.0)
     spin_for(node, 1.5)
     if capture_scans:
@@ -444,6 +506,8 @@ def save_scan_capture(node, output_path):
         ranges=ranges,
         angle_min=np.asarray([record["angle_min"] for record in node.scan_records]),
         angle_increment=np.asarray([record["angle_increment"] for record in node.scan_records]),
+        scan_time=np.asarray([record.get("scan_time", 0.0) for record in node.scan_records]),
+        time_increment=np.asarray([record.get("time_increment", 0.0) for record in node.scan_records]),
         range_min=np.asarray([record["range_min"] for record in node.scan_records]),
         range_max=np.asarray([record["range_max"] for record in node.scan_records]),
         scan_stamp_ns=np.asarray([record["scan_stamp_ns"] for record in node.scan_records], dtype=np.int64),
@@ -451,16 +515,271 @@ def save_scan_capture(node, output_path):
         pose_x=np.asarray([record["pose_x"] for record in node.scan_records]),
         pose_y=np.asarray([record["pose_y"] for record in node.scan_records]),
         pose_yaw=np.asarray([record["pose_yaw"] for record in node.scan_records]),
+        odom_angular_velocity=np.asarray([
+            record.get("odom_angular_velocity", 0.0) for record in node.scan_records
+        ]),
     )
     print(f"Raw synchronized capture saved: {output_path}", flush=True)
+
+
+def _scan_profile(record):
+    """Return a finite, acquisition-midpoint-deskewed range profile."""
+    import numpy as np
+
+    values = np.asarray(record["ranges"], dtype=float)
+    valid = np.isfinite(values)
+    valid &= values >= max(0.05, float(record["range_min"]))
+    valid &= values <= min(8.0, float(record["range_max"]))
+
+    # During a fast rotation, one D500 revolution is not instantaneous. The
+    # production driver mirrors the raw scan by mapping output bin i to raw
+    # bin j. Therefore acquisition time must follow raw bin j, not mirrored
+    # output index i. Using i here applies the deskew in the wrong temporal
+    # direction and biases accumulated lidar rotation.
+    increment = float(record.get("angle_increment", 0.0))
+    angle_min = float(record.get("angle_min", 0.0))
+    time_increment = float(record.get("time_increment", 0.0))
+    angular_velocity = float(record.get("odom_angular_velocity", 0.0))
+    if (
+        values.size
+        and increment > 0.0
+        and time_increment > 0.0
+        and math.isfinite(angular_velocity)
+        and abs(angular_velocity) > 1e-4
+    ):
+        indices = np.arange(values.size, dtype=float)
+        raw_angles = (-(angle_min + indices * increment)) % (2.0 * math.pi)
+        raw_indices = np.rint(raw_angles / increment).astype(int) % values.size
+        time_from_midpoint = (
+            raw_indices.astype(float) - 0.5 * (values.size - 1.0)
+        ) * time_increment
+        corrected_angles = (
+            angle_min + indices * increment + angular_velocity * time_from_midpoint
+        )
+        corrected_indices = np.rint(
+            (corrected_angles - angle_min) / increment
+        ).astype(int) % values.size
+        deskewed = np.full(values.size, np.nan, dtype=float)
+        deskewed_valid = np.zeros(values.size, dtype=bool)
+        valid_indices = np.flatnonzero(valid)
+        for source_index in valid_indices:
+            destination = corrected_indices[source_index]
+            if (
+                not deskewed_valid[destination]
+                or values[source_index] < deskewed[destination]
+            ):
+                deskewed[destination] = values[source_index]
+                deskewed_valid[destination] = True
+        values = deskewed
+        valid = deskewed_valid
+    return values, valid
+
+
+def _scan_shift_score(previous, previous_valid, current, current_valid, shift):
+    """Score one circular-bin shift; lower is a better geometric match."""
+    import numpy as np
+
+    aligned_current = np.roll(current, shift)
+    aligned_valid = np.roll(current_valid, shift)
+    valid = previous_valid & aligned_valid
+    if int(np.count_nonzero(valid)) < 120:
+        return float("inf")
+    difference = np.abs(previous[valid] - aligned_current[valid])
+    # Robustly limit a few moving/occluded rays from dominating the score.
+    return float(np.mean(np.minimum(difference, 0.50)))
+
+
+def _best_scan_shift(previous_record, current_record):
+    """Estimate the relative lidar rotation between adjacent scans."""
+    import numpy as np
+
+    previous, previous_valid = _scan_profile(previous_record)
+    current, current_valid = _scan_profile(current_record)
+    count = min(previous.size, current.size)
+    previous = previous[:count]
+    previous_valid = previous_valid[:count]
+    current = current[:count]
+    current_valid = current_valid[:count]
+    increment = float(current_record["angle_increment"])
+    if not math.isfinite(increment) or increment <= 0.0:
+        return None
+
+    max_shift_bins = max(4, int(round(math.radians(30.0) / increment)))
+    candidates = []
+    for shift in range(-max_shift_bins, max_shift_bins + 1):
+        score = _scan_shift_score(
+            previous,
+            previous_valid,
+            current,
+            current_valid,
+            shift,
+        )
+        if math.isfinite(score):
+            candidates.append((score, shift))
+    if not candidates:
+        return None
+
+    candidates.sort()
+    best_score, best_shift = candidates[0]
+    second_score = candidates[1][0] if len(candidates) > 1 else float("inf")
+
+    # Quadratic interpolation around the integer-bin minimum gives a more
+    # useful estimate than accumulating a whole 0.5-degree quantization error
+    # on every scan pair.
+    fractional_shift = float(best_shift)
+    if -max_shift_bins < best_shift < max_shift_bins:
+        left = _scan_shift_score(
+            previous,
+            previous_valid,
+            current,
+            current_valid,
+            best_shift - 1,
+        )
+        right = _scan_shift_score(
+            previous,
+            previous_valid,
+            current,
+            current_valid,
+            best_shift + 1,
+        )
+        curvature = left - 2.0 * best_score + right
+        if curvature > 1e-9:
+            offset = 0.5 * (left - right) / curvature
+            fractional_shift += max(-0.5, min(0.5, offset))
+
+    return {
+        "shift_bins": fractional_shift,
+        "shift_rad": fractional_shift * increment,
+        "score": best_score,
+        "second_score": second_score,
+        "valid_bins": int(np.count_nonzero(previous_valid)),
+    }
+
+
+def analyze_lidar_rotation(node, expected_angle_deg, direction, output_path):
+    """Estimate accumulated physical rotation from consecutive lidar scans.
+
+    This is intentionally separate from odometry. It sums the absolute
+    scan-to-scan angular changes, so a five-turn test is not reduced modulo
+    360 degrees. The scan geometry is used only to match successive static
+    environmental range profiles; odometry is not used to calculate the
+    accumulated lidar angle.
+    """
+    import json
+    import numpy as np
+
+    records = node.scan_records
+    pair_results = []
+    cumulative_lidar_rad = 0.0
+    cumulative_odom_rad = 0.0
+    trajectory_points = []
+    for previous, current in zip(records, records[1:]):
+        result = _best_scan_shift(previous, current)
+        if result is not None:
+            pair_results.append(result)
+            cumulative_lidar_rad += abs(float(result["shift_rad"]))
+            odom_delta = abs(
+                float(current.get("pose_yaw", 0.0))
+                - float(previous.get("pose_yaw", 0.0))
+            )
+            cumulative_odom_rad += odom_delta
+            trajectory_points.append((cumulative_odom_rad, cumulative_lidar_rad))
+
+    if len(pair_results) < 8:
+        raise RuntimeError(
+            f"Only {len(pair_results)} usable lidar scan pairs; "
+            "not enough for independent rotation validation"
+        )
+
+    increments = np.asarray([item["shift_rad"] for item in pair_results], dtype=float)
+    increment_abs_deg = np.degrees(np.abs(increments))
+    accumulated_deg = float(np.sum(increment_abs_deg))
+    expected_abs_deg = abs(float(expected_angle_deg))
+    error_deg = accumulated_deg - expected_abs_deg
+    scores = np.asarray([item["score"] for item in pair_results], dtype=float)
+    fit_points = np.asarray(trajectory_points, dtype=float)
+    fit_margin_rad = math.radians(20.0)
+    fit_mask = (
+        (fit_points[:, 0] >= fit_margin_rad)
+        & (fit_points[:, 0] <= max(fit_margin_rad, cumulative_odom_rad - fit_margin_rad))
+    )
+    if int(np.count_nonzero(fit_mask)) >= 8:
+        fit_slope, fit_intercept = np.polyfit(
+            fit_points[fit_mask, 0],
+            fit_points[fit_mask, 1],
+            1,
+        )
+        fitted_lidar_for_target_deg = math.degrees(fit_slope * math.radians(expected_abs_deg))
+        fit_residual_deg = fitted_lidar_for_target_deg - expected_abs_deg
+    else:
+        fit_slope = float("nan")
+        fit_intercept = float("nan")
+        fitted_lidar_for_target_deg = float("nan")
+        fit_residual_deg = float("nan")
+    result = {
+        "method": "midpoint-deskewed consecutive-scan circular range-profile matching",
+        "scan_count_captured": len(records),
+        "usable_pair_count": len(pair_results),
+        "expected_turns": expected_abs_deg / 360.0,
+        "expected_rotation_deg": expected_abs_deg,
+        "direction_requested": int(direction),
+        "lidar_accumulated_rotation_deg": accumulated_deg,
+        "lidar_observed_turns": accumulated_deg / 360.0,
+        "lidar_rotation_error_deg": error_deg,
+        "lidar_rotation_scale_error_percent": (
+            100.0 * error_deg / expected_abs_deg if expected_abs_deg else None
+        ),
+        "cruise_scale_fit": {
+            "fit_pairs": int(np.count_nonzero(fit_mask)),
+            "odom_span_deg": math.degrees(cumulative_odom_rad),
+            "lidar_per_odom_scale": float(fit_slope),
+            "intercept_rad": float(fit_intercept),
+            "fitted_lidar_rotation_for_target_deg": fitted_lidar_for_target_deg,
+            "fitted_rotation_error_deg": fit_residual_deg,
+            "fitted_scale_error_percent": (
+                100.0 * fit_residual_deg / expected_abs_deg
+                if expected_abs_deg and math.isfinite(fit_residual_deg)
+                else None
+            ),
+            "excluded_start_end_deg": 20.0,
+        },
+        "median_pair_rotation_deg": float(np.median(increment_abs_deg)),
+        "p95_pair_rotation_deg": float(np.percentile(increment_abs_deg, 95)),
+        "median_match_score_m": float(np.median(scores)),
+        "p95_match_score_m": float(np.percentile(scores, 95)),
+        "note": (
+            "Accumulated angle is not wrapped modulo 360 degrees. "
+            "This is an independent scan-geometry estimate and can fail in "
+            "a geometrically feature-poor or highly symmetric environment."
+        ),
+    }
+    with open(output_path, "w", encoding="utf-8") as stream:
+        json.dump(result, stream, indent=2)
+    print(json.dumps(result, indent=2), flush=True)
+    return result
 
 
 def self_test():
     assert abs(abs(wrap_pi(3.0 * math.pi)) - math.pi) < 1e-12
     assert abs(coast_distance(0.4) - (0.4 * STOP_LATENCY_S + 0.4**2 / (2 * STOP_DECEL_RAD_S2) + STOP_MARGIN_RAD)) < 1e-12
-    assert pid_command(2.0, 0.0, 1.0) == MAX_OMEGA
-    assert pid_command(-0.1, 0.0, 1.0) == 0.0
-    assert pid_command(-1.0, 0.0, -1.0) < 0.0
+    command, phase, magnitude = profile_command(2.0, 0.0, 1.0)
+    assert command == MAX_OMEGA and magnitude == MAX_OMEGA and phase == "cruise"
+    command, phase, magnitude = profile_command(
+        math.radians(8.0), 0.0, 1.0, previous_command=MAX_OMEGA
+    )
+    assert 0.0 < command < MAX_OMEGA and phase == "braking"
+    command, phase, magnitude = profile_command(
+        math.radians(10.0), 0.75, 1.0, previous_command=MAX_OMEGA
+    )
+    assert 0.0 < command < MAX_OMEGA and phase == "braking"
+    command, phase, magnitude = profile_command(
+        math.radians(2.0), 0.30, 1.0, previous_command=MIN_EFFECTIVE_OMEGA
+    )
+    assert command == 0.0 and phase == "stop"
+    command, phase, magnitude = profile_command(-0.01, 0.30, 1.0)
+    assert command == 0.0 and phase == "overshot"
+    command, phase, magnitude = profile_command(2.0, 0.0, -1.0)
+    assert command == -MAX_OMEGA and phase == "cruise"
     print("self-test: PASS")
 
 
@@ -468,10 +787,39 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--angle-deg", type=float, default=360.0)
     parser.add_argument("--direction", type=int, choices=(-1, 1), default=1)
-    parser.add_argument("--tolerance-deg", type=float, default=0.75)
+    parser.add_argument(
+        "--tolerance-deg",
+        type=float,
+        default=0.50,
+        help="accepted final unwrapped /odom error (default: 0.50)",
+    )
+    parser.add_argument(
+        "--max-omega",
+        type=float,
+        default=MAX_OMEGA,
+        help="closed-loop angular-velocity ceiling in rad/s (default: 0.75)",
+    )
+    parser.add_argument(
+        "--stop-margin-deg",
+        type=float,
+        default=math.degrees(STOP_MARGIN_RAD),
+        help=(
+            "test-controller-only coast-distance compensation in degrees "
+            f"(default: {math.degrees(STOP_MARGIN_RAD):.2f}; not geometry calibration)"
+        ),
+    )
     parser.add_argument("--capture-lidar-xy", action="store_true")
+    parser.add_argument(
+        "--capture-lidar-rotation",
+        action="store_true",
+        help="capture scans and independently estimate accumulated rotation",
+    )
     parser.add_argument("--capture-output", default="/home/robot1/r1_lidar_xy_rotation_capture.npz")
     parser.add_argument("--analysis-output", default="/home/robot1/r1_lidar_xy_rotation_analysis.json")
+    parser.add_argument(
+        "--rotation-analysis-output",
+        default="/home/robot1/r1_lidar_rotation_analysis.json",
+    )
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
@@ -479,6 +827,14 @@ def main():
         return 0
     if args.angle_deg <= 0.0:
         parser.error("--angle-deg must be positive")
+    if not 0.0 < args.tolerance_deg <= 10.0:
+        parser.error("--tolerance-deg must be in (0, 10]")
+    if not MIN_EFFECTIVE_OMEGA <= args.max_omega <= 2.0:
+        parser.error(
+            f"--max-omega must be in [{MIN_EFFECTIVE_OMEGA}, 2.0] rad/s"
+        )
+    if not -5.0 <= args.stop_margin_deg <= 20.0:
+        parser.error("--stop-margin-deg must be between -5 and 20 degrees")
 
     rclpy.init()
     node = OdomFeedback()
@@ -488,17 +844,34 @@ def main():
             math.radians(args.angle_deg),
             args.direction,
             math.radians(args.tolerance_deg),
-            capture_scans=args.capture_lidar_xy,
+            max_omega=args.max_omega,
+            stop_margin_rad=math.radians(args.stop_margin_deg),
+            capture_scans=args.capture_lidar_xy or args.capture_lidar_rotation,
+        )
+        passed = abs(final_error) <= math.radians(args.tolerance_deg)
+        print(
+            f"Rotation result: {'PASS' if passed else 'FAIL'} "
+            f"(absolute /odom error={math.degrees(abs(final_error)):.5f} deg)",
+            flush=True,
         )
         if args.capture_lidar_xy:
             save_scan_capture(node, args.capture_output)
             analyze_lidar_xy(node, args.analysis_output)
+        elif args.capture_lidar_rotation:
+            save_scan_capture(node, args.capture_output)
+        if args.capture_lidar_rotation:
+            analyze_lidar_rotation(
+                node,
+                args.angle_deg,
+                args.direction,
+                args.rotation_analysis_output,
+            )
     finally:
         node.publish_omega(0.0)
         spin_for(node, 0.3)
         node.destroy_node()
         rclpy.shutdown()
-    return 0
+    return 0 if passed else 2
 
 
 if __name__ == "__main__":

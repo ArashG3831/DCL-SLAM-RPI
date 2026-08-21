@@ -3,6 +3,8 @@
 import csv
 import math
 import os
+import queue
+import threading
 import time
 from collections import deque
 from datetime import datetime
@@ -88,6 +90,11 @@ RIGHT_RPM_SCALE = 1.00
 PID_BENCH_ENABLE = False
 PID_BENCH_DURATION_S = 2.0
 PID_BENCH_DIR = "~/pid_bench_logs"
+
+# A diagnostic deadline miss is a cycle that starts more than 1 ms after its
+# monotonic deadline. This threshold is diagnostic-only and does not alter
+# production safety behavior.
+CONTROL_DEADLINE_MISS_TOLERANCE_S = 0.001
 
 
 def _percentile(values, percentile):
@@ -181,6 +188,82 @@ class EncoderTimingDiagnostics:
         )
 
 
+class ControlTimingDiagnostics:
+    """Bounded timing metrics for the dedicated 20 Hz control thread."""
+
+    WINDOW_SIZE = 8192
+
+    def __init__(self):
+        self.enabled = (
+            os.environ.get("R1_CONTROL_DIAGNOSTICS", "0") == "1"
+            or os.environ.get("R1_ENCODER_DIAGNOSTICS", "0") == "1"
+        )
+        self.periods = deque(maxlen=self.WINDOW_SIZE)
+        self.execution_times = deque(maxlen=self.WINDOW_SIZE)
+        self.deadline_lateness = deque(maxlen=self.WINDOW_SIZE)
+        self.encoder_ages = deque(maxlen=self.WINDOW_SIZE)
+        self.last_actual_start = None
+        self.deadline_misses = 0
+        self.skipped_deadlines = 0
+        self.max_overrun = 0.0
+        self.max_encoder_age = 0.0
+        self.encoder_age_unknown_cycles = 0
+
+    def cycle_start(self, scheduled_start, actual_start):
+        if not self.enabled:
+            return
+
+        if self.last_actual_start is not None:
+            self.periods.append(actual_start - self.last_actual_start)
+        self.last_actual_start = actual_start
+
+        lateness = max(0.0, actual_start - scheduled_start)
+        self.deadline_lateness.append(lateness)
+        if lateness > CONTROL_DEADLINE_MISS_TOLERANCE_S:
+            self.deadline_misses += 1
+
+    def cycle_end(self, actual_start, actual_end, encoder_age):
+        if not self.enabled:
+            return
+
+        execution = max(0.0, actual_end - actual_start)
+        self.execution_times.append(execution)
+        self.max_overrun = max(
+            self.max_overrun,
+            max(0.0, execution - CONTROL_DT),
+        )
+        if math.isfinite(encoder_age):
+            self.encoder_ages.append(max(0.0, encoder_age))
+            self.max_encoder_age = max(self.max_encoder_age, encoder_age)
+        else:
+            self.encoder_age_unknown_cycles += 1
+
+    def skipped(self, count):
+        if self.enabled:
+            self.skipped_deadlines += max(0, int(count))
+
+    def summary(self):
+        if not self.enabled:
+            return "disabled"
+
+        return (
+            "CONTROL_TIMING "
+            f"period_p50={_percentile(list(self.periods), 50.0) * 1000.0:.3f}ms "
+            f"period_p95={_percentile(list(self.periods), 95.0) * 1000.0:.3f}ms "
+            f"period_p99={_percentile(list(self.periods), 99.0) * 1000.0:.3f}ms "
+            f"period_max={max(self.periods, default=0.0) * 1000.0:.3f}ms "
+            f"exec_p50={_percentile(list(self.execution_times), 50.0) * 1000.0:.3f}ms "
+            f"exec_p95={_percentile(list(self.execution_times), 95.0) * 1000.0:.3f}ms "
+            f"exec_p99={_percentile(list(self.execution_times), 99.0) * 1000.0:.3f}ms "
+            f"exec_max={max(self.execution_times, default=0.0) * 1000.0:.3f}ms "
+            f"deadline_misses={self.deadline_misses} "
+            f"skipped_deadlines={self.skipped_deadlines} "
+            f"max_overrun={self.max_overrun * 1000.0:.3f}ms "
+            f"encoder_age_max={self.max_encoder_age * 1000.0:.3f}ms "
+            f"encoder_age_unknown_cycles={self.encoder_age_unknown_cycles}"
+        )
+
+
 class MotorPI:
     def __init__(
         self,
@@ -197,6 +280,7 @@ class MotorPI:
         startup_grace_s=0.60,
     ):
         self.name = name
+        self.state_lock = threading.RLock()
         self.motor_sign = motor_sign
         self.counts_per_wheel_revolution = float(counts_per_wheel_revolution)
         self.safety_window_s = float(safety_window_s)
@@ -237,6 +321,7 @@ class MotorPI:
         self.last_measured_rpm = 0.0
         self.last_command = 0.0
         self.motion_grace_until = now
+        self.start_command_pending = None
 
         # Samples are (time, signed count delta, valid delta, invalid delta,
         # A edge delta, B edge delta).
@@ -269,6 +354,8 @@ class MotorPI:
         return snapshot
 
     def raw_drive(self, command):
+        # Physical motor writes are confined to the control thread, except
+        # for the final shutdown stop after that thread has joined.
         command = max(-1.0, min(1.0, command))
         command *= self.motor_sign
 
@@ -289,48 +376,65 @@ class MotorPI:
         self.last_command = command / self.motor_sign
 
     def stop(self):
-        self.pwm.value = 0.0
-        self.in1.off()
-        self.in2.off()
-        self.last_command = 0.0
+        with self.state_lock:
+            self.pwm.value = 0.0
+            self.in1.off()
+            self.in2.off()
+            self.last_command = 0.0
+            self.start_command_pending = None
 
     def clear_health_state(self):
-        self.health_samples.clear()
-        self.underspeed_since = None
-        self.implausible_rpm_cycles = 0
+        with self.state_lock:
+            self.health_samples.clear()
+            self.underspeed_since = None
+            self.implausible_rpm_cycles = 0
 
     def set_target_rpm(self, target_rpm):
-        target_rpm = max(-MAX_TARGET_RPM, min(MAX_TARGET_RPM, float(target_rpm)))
+        with self.state_lock:
+            target_rpm = max(
+                -MAX_TARGET_RPM,
+                min(MAX_TARGET_RPM, float(target_rpm)),
+            )
 
-        old_direction = self.command_direction
-        new_direction = 1 if target_rpm > 0 else -1 if target_rpm < 0 else 0
+            old_direction = self.command_direction
+            new_direction = 1 if target_rpm > 0 else -1 if target_rpm < 0 else 0
 
-        if abs(target_rpm - self.target_rpm) < 1e-6:
-            return
+            if abs(target_rpm - self.target_rpm) < 1e-6:
+                return
 
-        self.target_rpm = target_rpm
-        self.command_direction = new_direction
-        self.target_abs_rpm = abs(target_rpm)
+            self.target_rpm = target_rpm
+            self.command_direction = new_direction
+            self.target_abs_rpm = abs(target_rpm)
 
-        # Do not reset encoder measurement for ordinary target changes.
-        if self.command_direction == 0:
-            self.integral = 0.0
-            self.clear_health_state()
-            self.stop()
-            return
+            # Do not reset encoder measurement for ordinary target changes.
+            # The control thread performs the physical stop on its next cycle.
+            if self.command_direction == 0:
+                self.integral = 0.0
+                self.health_samples.clear()
+                self.underspeed_since = None
+                self.implausible_rpm_cycles = 0
+                self.start_command_pending = None
+                return
 
-        # Apply grace only when motion begins or truly reverses. Nav2 changes
-        # target magnitude frequently, which must not continuously reset safety.
-        if old_direction == 0 or old_direction != self.command_direction:
-            self.integral = 0.0
-            self.clear_health_state()
-            self.motion_grace_until = time.monotonic() + self.startup_grace_s
+            # Apply grace only when motion begins or truly reverses. Nav2
+            # changes target magnitude frequently, which must not continuously
+            # reset safety. The initial physical drive is deferred to update().
+            if old_direction == 0 or old_direction != self.command_direction:
+                self.integral = 0.0
+                self.health_samples.clear()
+                self.underspeed_since = None
+                self.implausible_rpm_cycles = 0
+                self.motion_grace_until = time.monotonic() + self.startup_grace_s
 
-            start_mag = self.target_abs_rpm / MAX_RPM_ESTIMATE
-            start_mag = max(0.25, min(1.0, start_mag))
-            self.raw_drive(self.command_direction * start_mag)
+                start_mag = self.target_abs_rpm / MAX_RPM_ESTIMATE
+                start_mag = max(0.25, min(1.0, start_mag))
+                self.start_command_pending = self.command_direction * start_mag
 
     def update(self):
+        with self.state_lock:
+            return self._update_locked()
+
+    def _update_locked(self):
         now = time.monotonic()
         snapshot = self.get_encoder_snapshot()
 
@@ -369,6 +473,10 @@ class MotorPI:
         if self.command_direction == 0:
             self.stop()
         else:
+            if self.start_command_pending is not None:
+                self.raw_drive(self.start_command_pending)
+                self.start_command_pending = None
+
             error = self.target_abs_rpm - measured_abs_rpm
             self.integral += error * dt
             self.integral = max(-30.0, min(30.0, self.integral))
@@ -406,9 +514,10 @@ class MotorPI:
         }
 
     def window_metrics(self, now):
-        cutoff = now - self.safety_window_s
-        while self.health_samples and self.health_samples[0][0] < cutoff:
-            self.health_samples.popleft()
+        with self.state_lock:
+            cutoff = now - self.safety_window_s
+            while self.health_samples and self.health_samples[0][0] < cutoff:
+                self.health_samples.popleft()
 
         count_window = sum(sample[1] for sample in self.health_samples)
         valid_window = sum(sample[2] for sample in self.health_samples)
@@ -453,13 +562,10 @@ class RealDiffDriveNode(Node):
         # Robot 1 physical wheel diameter is 0.070 m, so radius is 0.0350 m.
         # Confirmed by the 1.15 m/1.17 m floor run and encoder counts.
         self.declare_parameter("wheel_radius_m", 0.0350)
-        # Physical center-to-center measurement used for command kinematics: 0.209 m.
-        # Floor-spin calibration produced a different effective odometry width.
-        self.declare_parameter("wheel_separation_cmd_m", 0.209)
-        # Empirically calibrated effective track width for floor odometry.
-        # Mean of independent slow clockwise/counterclockwise 10-turn tests:
-        # 0.22152 m and 0.22176 m -> 0.2216 m.
-        self.declare_parameter("wheel_separation_odom_m", 0.2216)
+        # Shared wheel-separation calibration from the bidirectional spin
+        # tests: 0.22235 m (222.35 mm).
+        self.declare_parameter("wheel_separation_cmd_m", 0.22235)
+        self.declare_parameter("wheel_separation_odom_m", 0.22235)
         self.declare_parameter("cmd_timeout_s", 0.7)
         self.declare_parameter(
             "encoder_counts_per_wheel_revolution",
@@ -557,13 +663,16 @@ class RealDiffDriveNode(Node):
         self.x = 0.0
         self.y = 0.0
         self.theta = 0.0
+        self.command_lock = threading.RLock()
         self.last_odom_time = time.monotonic()
         self.last_cmd_time = time.monotonic()
         self.last_debug_time = time.monotonic()
         self.last_encoder_diag_time = self.last_debug_time
-        self.last_control_diag_time = self.last_debug_time
-        self.control_diag_gaps = deque(maxlen=8192)
-        self.control_diag_max_gap = 0.0
+        self.control_timing = ControlTimingDiagnostics()
+        self.last_control_encoder_age = float("inf")
+        self.control_stop_event = threading.Event()
+        self.control_thread = None
+        self.control_thread_error = None
 
         factory = Device.pin_factory
         self.get_logger().info(
@@ -574,6 +683,11 @@ class RealDiffDriveNode(Node):
             "Encoder timing diagnostics: "
             f"{'enabled' if self.left.timing_diagnostics.enabled else 'disabled'} "
             "(set R1_ENCODER_DIAGNOSTICS=1 to enable)"
+        )
+        self.get_logger().info(
+            "Control timing diagnostics: "
+            f"{'enabled' if self.control_timing.enabled else 'disabled'} "
+            "(set R1_CONTROL_DIAGNOSTICS=1 to enable)"
         )
         self.last_fault_ignore_log_time = 0.0
 
@@ -592,7 +706,18 @@ class RealDiffDriveNode(Node):
         self.csv_writer = None
         self.csv_path = None
         self.csv_rows_since_flush = 0
+        self.safety_log_queue = queue.Queue(maxsize=256)
+        self.safety_log_stop_event = threading.Event()
+        self.safety_log_thread = None
+        self.safety_log_drop_count = 0
         self.open_safety_log()
+        if self.csv_file:
+            self.safety_log_thread = threading.Thread(
+                target=self._safety_log_loop,
+                name="motor_safety_log_writer",
+                daemon=True,
+            )
+            self.safety_log_thread.start()
 
         self.odom_pub = self.create_publisher(Odometry, "/odom", 10)
         fault_qos = QoSProfile(
@@ -606,7 +731,6 @@ class RealDiffDriveNode(Node):
 
         self.create_subscription(TwistStamped, "/cmd_vel", self.cmd_vel_stamped_cb, 10)
         self.create_subscription(Twist, "/cmd_vel_unstamped", self.cmd_vel_cb, 10)
-        self.timer = self.create_timer(CONTROL_DT, self.update)
 
         self.get_logger().info("real_diffdrive_node started with dual-channel encoder safety")
         self.get_logger().info("Subscribing: /cmd_vel [TwistStamped], /cmd_vel_unstamped [Twist]")
@@ -634,6 +758,16 @@ class RealDiffDriveNode(Node):
         )
         if self.csv_path:
             self.get_logger().info(f"Motor safety CSV: {self.csv_path}")
+
+        self.control_thread = threading.Thread(
+            target=self._control_loop,
+            name="motor_control_20hz",
+            daemon=True,
+        )
+        self.control_thread.start()
+        self.get_logger().info(
+            "Dedicated monotonic-deadline motor control thread started at 20 Hz"
+        )
 
     def open_safety_log(self):
         log_dir = os.path.expanduser(
@@ -691,6 +825,23 @@ class RealDiffDriveNode(Node):
             self.csv_path = None
             self.get_logger().error(f"Could not open motor safety CSV: {exc}")
 
+    def _safety_log_loop(self):
+        """Write safety CSV rows outside the latency-sensitive control loop."""
+        while (
+            not self.safety_log_stop_event.is_set()
+            or not self.safety_log_queue.empty()
+        ):
+            try:
+                row = self.safety_log_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            self.csv_writer.writerow(row)
+            self.csv_rows_since_flush += 1
+            if self.csv_rows_since_flush >= 20 or row[-3]:
+                self.csv_file.flush()
+                self.csv_rows_since_flush = 0
+
     def rpm_to_mps(self, rpm):
         return (rpm / 60.0) * (2.0 * math.pi * self.wheel_radius)
 
@@ -705,31 +856,32 @@ class RealDiffDriveNode(Node):
 
     def handle_twist(self, twist):
         now = time.monotonic()
-        if self.fault_latched:
-            if now - self.last_fault_ignore_log_time >= 2.0:
-                self.get_logger().error(
-                    f"Ignoring cmd_vel because motor fault is latched: {self.fault_reason}"
-                )
-                self.last_fault_ignore_log_time = now
-            self.left.stop()
-            self.right.stop()
-            return
+        with self.command_lock:
+            if self.fault_latched:
+                if now - self.last_fault_ignore_log_time >= 2.0:
+                    self.get_logger().error(
+                        f"Ignoring cmd_vel because motor fault is latched: {self.fault_reason}"
+                    )
+                    self.last_fault_ignore_log_time = now
+                # Safety output is owned by the control thread.  A ROS command
+                # callback must never be the clock that writes the H-bridge.
+                return
 
-        v = float(twist.linear.x)
-        omega = float(twist.angular.z)
+            v = float(twist.linear.x)
+            omega = float(twist.angular.z)
 
-        v_left = v - omega * self.wheel_separation_cmd / 2.0
-        v_right = v + omega * self.wheel_separation_cmd / 2.0
+            v_left = v - omega * self.wheel_separation_cmd / 2.0
+            v_right = v + omega * self.wheel_separation_cmd / 2.0
 
-        rpm_left = self.mps_to_rpm(v_left) * LEFT_RPM_SCALE
-        rpm_right = self.mps_to_rpm(v_right) * RIGHT_RPM_SCALE
+            rpm_left = self.mps_to_rpm(v_left) * LEFT_RPM_SCALE
+            rpm_right = self.mps_to_rpm(v_right) * RIGHT_RPM_SCALE
 
-        rpm_left = apply_motor_deadband_rpm(rpm_left)
-        rpm_right = apply_motor_deadband_rpm(rpm_right)
+            rpm_left = apply_motor_deadband_rpm(rpm_left)
+            rpm_right = apply_motor_deadband_rpm(rpm_right)
 
-        self.left.set_target_rpm(rpm_left)
-        self.right.set_target_rpm(rpm_right)
-        self.last_cmd_time = now
+            self.left.set_target_rpm(rpm_left)
+            self.right.set_target_rpm(rpm_right)
+            self.last_cmd_time = now
 
         # Deliberately do not reset last_debug_time here. Nav2 publishes
         # continuously, and resetting it hid all moving-state debug output.
@@ -851,30 +1003,31 @@ class RealDiffDriveNode(Node):
         return candidates
 
     def latch_fault(self, reason, detail):
-        if self.fault_latched:
-            return
+        with self.command_lock:
+            if self.fault_latched:
+                return
 
-        self.fault_latched = True
-        self.fault_reason = reason
-        self.fault_detail = detail
+            self.fault_latched = True
+            self.fault_reason = reason
+            self.fault_detail = detail
 
-        self.left.set_target_rpm(0.0)
-        self.right.set_target_rpm(0.0)
-        self.left.stop()
-        self.right.stop()
+            self.left.set_target_rpm(0.0)
+            self.right.set_target_rpm(0.0)
+            self.left.stop()
+            self.right.stop()
 
-        message = String()
-        message.data = f"{reason}: {detail}"
-        self.fault_pub.publish(message)
+            message = String()
+            message.data = f"{reason}: {detail}"
+            self.fault_pub.publish(message)
 
-        self.get_logger().fatal("=" * 72)
-        self.get_logger().fatal(f"MOTOR SAFETY FAULT LATCHED: {reason}")
-        self.get_logger().fatal(detail)
-        self.get_logger().fatal("Both motors stopped. Restart the node to clear the fault.")
-        self.get_logger().fatal("=" * 72)
+            self.get_logger().fatal("=" * 72)
+            self.get_logger().fatal(f"MOTOR SAFETY FAULT LATCHED: {reason}")
+            self.get_logger().fatal(detail)
+            self.get_logger().fatal("Both motors stopped. Restart the node to clear the fault.")
+            self.get_logger().fatal("=" * 72)
 
-        if self.csv_file:
-            self.csv_file.flush()
+            if self.csv_file:
+                self.csv_file.flush()
 
     def evaluate_safety(self, left_state, right_state, left_metrics, right_metrics, now):
         if not self.safety_enabled or self.fault_latched:
@@ -905,7 +1058,7 @@ class RealDiffDriveNode(Node):
         if not self.csv_writer:
             return
 
-        self.csv_writer.writerow([
+        row = [
             datetime.now().isoformat(timespec="milliseconds"),
             f"{now:.6f}",
             f"{self.left.target_rpm:.6f}",
@@ -949,22 +1102,68 @@ class RealDiffDriveNode(Node):
             int(self.fault_latched),
             self.fault_reason,
             self.fault_detail,
-        ])
+        ]
 
-        self.csv_rows_since_flush += 1
-        if self.csv_rows_since_flush >= 20 or self.fault_latched:
-            self.csv_file.flush()
-            self.csv_rows_since_flush = 0
+        try:
+            self.safety_log_queue.put_nowait(row)
+        except queue.Full:
+            self.safety_log_drop_count += 1
+
+    def _control_loop(self):
+        """Run the physical 20 Hz cycle on a monotonic deadline schedule."""
+        next_deadline = time.monotonic()
+
+        try:
+            while not self.control_stop_event.is_set():
+                remaining = next_deadline - time.monotonic()
+                if remaining > 0.0:
+                    if self.control_stop_event.wait(remaining):
+                        break
+
+                if self.control_stop_event.is_set():
+                    break
+
+                scheduled_start = next_deadline
+                actual_start = time.monotonic()
+                self.control_timing.cycle_start(scheduled_start, actual_start)
+
+                try:
+                    self.update()
+                except Exception as exc:
+                    self.control_thread_error = repr(exc)
+                    self.get_logger().fatal(
+                        f"Dedicated motor control thread failed: {exc!r}"
+                    )
+                    self.left.stop()
+                    self.right.stop()
+                    break
+                finally:
+                    actual_end = time.monotonic()
+                    self.control_timing.cycle_end(
+                        actual_start,
+                        actual_end,
+                        self.last_control_encoder_age,
+                    )
+
+                next_deadline += CONTROL_DT
+                now = time.monotonic()
+                if next_deadline <= now:
+                    skipped = int((now - next_deadline) // CONTROL_DT) + 1
+                    self.control_timing.skipped(skipped)
+                    next_deadline += skipped * CONTROL_DT
+        finally:
+            self.left.stop()
+            self.right.stop()
 
     def update(self):
-        now = time.monotonic()
+        # The control thread owns the physical cycle.  The RLock also makes
+        # command updates and safety state transitions atomic with respect to
+        # the cycle without holding a lock across ROS publication callbacks.
+        with self.command_lock:
+            return self._update_locked()
 
-        if self.left.timing_diagnostics.enabled:
-            control_gap = now - self.last_control_diag_time
-            if control_gap >= 0.0:
-                self.control_diag_gaps.append(control_gap)
-                self.control_diag_max_gap = max(self.control_diag_max_gap, control_gap)
-            self.last_control_diag_time = now
+    def _update_locked(self):
+        now = time.monotonic()
 
         if self.fault_latched:
             self.left.stop()
@@ -977,16 +1176,20 @@ class RealDiffDriveNode(Node):
         right_state = self.right.update()
         left_metrics = self.left.window_metrics(now)
         right_metrics = self.right.window_metrics(now)
-
-        if self.left.timing_diagnostics.enabled and now - self.last_encoder_diag_time >= 1.0:
-            self.get_logger().info(
-                "ENCODER_TIMING "
-                f"control_gap_max={self.control_diag_max_gap * 1000.0:.3f}ms "
-                f"control_gap_p99={_percentile(list(self.control_diag_gaps), 99.0) * 1000.0:.3f}ms | "
-                f"{self.left.timing_diagnostics.summary()} | "
-                f"{self.right.timing_diagnostics.summary()}"
+        if (
+            abs(self.left.target_rpm) > 0.2
+            or abs(self.right.target_rpm) > 0.2
+        ):
+            self.last_control_encoder_age = max(
+                left_metrics["a_age_s"],
+                left_metrics["b_age_s"],
+                right_metrics["a_age_s"],
+                right_metrics["b_age_s"],
             )
-            self.last_encoder_diag_time = now
+        else:
+            # Do not turn the intentional post-command stop interval into a
+            # false encoder-age maximum in the timing report.
+            self.last_control_encoder_age = 0.0
 
         self.evaluate_safety(left_state, right_state, left_metrics, right_metrics, now)
         self.write_safety_log(now, left_state, right_state, left_metrics, right_metrics)
@@ -1034,27 +1237,6 @@ class RealDiffDriveNode(Node):
                 self.bench_writer = None
 
         self.bench_prev_moving = moving_cmd
-
-        if now - self.last_debug_time > 1.0:
-            self.get_logger().info(
-                f"L target={self.left.target_rpm:+.2f}rpm "
-                f"measured={left_state['measured_rpm']:+.2f} "
-                f"pwm={left_state['command']:+.3f} "
-                f"count={left_state['count_delta']} "
-                f"valid/invalid={left_state['valid_transition_delta']}/"
-                f"{left_state['invalid_transition_delta']} "
-                f"A/B_edges={left_state['a_edge_delta']}/{left_state['b_edge_delta']} "
-                f"ages={left_metrics['a_age_s']:.3f}/{left_metrics['b_age_s']:.3f}s | "
-                f"R target={self.right.target_rpm:+.2f}rpm "
-                f"measured={right_state['measured_rpm']:+.2f} "
-                f"pwm={right_state['command']:+.3f} "
-                f"count={right_state['count_delta']} "
-                f"valid/invalid={right_state['valid_transition_delta']}/"
-                f"{right_state['invalid_transition_delta']} "
-                f"A/B_edges={right_state['a_edge_delta']}/{right_state['b_edge_delta']} "
-                f"ages={right_metrics['a_age_s']:.3f}/{right_metrics['b_age_s']:.3f}s"
-            )
-            self.last_debug_time = now
 
         dt = now - self.last_odom_time
         self.last_odom_time = now
@@ -1115,16 +1297,29 @@ class RealDiffDriveNode(Node):
         self.tf_broadcaster.sendTransform(t)
 
     def stop_and_close(self):
-        if self.left.timing_diagnostics.enabled:
+        self.control_stop_event.set()
+        if (
+            self.control_thread
+            and self.control_thread is not threading.current_thread()
+        ):
+            self.control_thread.join(timeout=2.0)
+
+        if self.left.timing_diagnostics.enabled or self.control_timing.enabled:
             self.get_logger().info(
                 "ENCODER_TIMING_FINAL "
-                f"control_gap_max={self.control_diag_max_gap * 1000.0:.3f}ms "
-                f"control_gap_p99={_percentile(list(self.control_diag_gaps), 99.0) * 1000.0:.3f}ms | "
+                f"{self.control_timing.summary()} | "
                 f"{self.left.timing_diagnostics.summary()} | "
                 f"{self.right.timing_diagnostics.summary()}"
             )
         self.left.stop()
         self.right.stop()
+
+        self.safety_log_stop_event.set()
+        if (
+            self.safety_log_thread
+            and self.safety_log_thread is not threading.current_thread()
+        ):
+            self.safety_log_thread.join(timeout=2.0)
 
         if self.bench_file:
             self.bench_file.flush()
