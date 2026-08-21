@@ -1,0 +1,23 @@
+{
+  "python_node": "d500_ros2_scan.py",
+  "cpp_node": "d500_ros2_scan_cpp",
+  "default_production_backend": "python",
+  "protocol": {
+    "header": [84, 44],
+    "packet_length": 47,
+    "points_per_packet": 12,
+    "crc_polynomial": "0x4d",
+    "baud": 230400,
+    "serial_timeout_s": 0.05
+  },
+  "scan": {
+    "topic": "/scan",
+    "production_frame_id": "d500_lidar",
+    "bins": 720,
+    "min_range_mm": 30,
+    "max_range_mm": 12000,
+    "scan_timestamp": "host_acquisition_midpoint",
+    "mirror_correction": "preserved"
+  },
+  "status": "parser_golden_parity_in_progress"
+}

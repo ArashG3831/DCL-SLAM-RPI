@@ -1,0 +1,39 @@
+{
+  "python_node": "real_diffdrive_node",
+  "cpp_node": "real_diffdrive_node_cpp",
+  "default_production_backend": "python",
+  "topics": {
+    "subscriptions": [
+      {"name": "/cmd_vel", "type": "geometry_msgs/msg/TwistStamped", "qos_depth": 10},
+      {"name": "/cmd_vel_unstamped", "type": "geometry_msgs/msg/Twist", "qos_depth": 10}
+    ],
+    "publications": [
+      {"name": "/odom", "type": "nav_msgs/msg/Odometry", "qos_depth": 10},
+      {"name": "/motor_safety/fault", "type": "std_msgs/msg/String", "depth": 1, "reliable": true, "transient_local": true}
+    ]
+  },
+  "frozen_calibration": {
+    "wheel_radius_m": 0.035,
+    "encoder_counts_per_wheel_revolution": 4606,
+    "wheel_separation_cmd_m": 0.22235,
+    "wheel_separation_odom_m": 0.22235,
+    "right_encoder_sign": 1,
+    "left_encoder_sign": -1
+  },
+  "safety": {
+    "cmd_timeout_s": 0.7,
+    "window_s": 0.35,
+    "startup_grace_s": 0.6,
+    "min_target_rpm": 10.0,
+    "min_pwm": 0.22,
+    "no_pulse_timeout_s": 0.35,
+    "min_window_pulses": 20,
+    "channel_ratio_min": 0.35,
+    "max_encoder_rpm": 90.0,
+    "implausible_rpm_cycles": 2,
+    "underspeed_ratio": 0.2,
+    "underspeed_pwm": 0.65,
+    "underspeed_timeout_s": 0.8
+  },
+  "status": "synthetic_core_parity_in_progress"
+}

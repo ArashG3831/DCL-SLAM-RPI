@@ -1,0 +1,27 @@
+{
+  "baseline_commit": "3be3371",
+  "production_default": {"motor": "python", "d500": "python"},
+  "safe_validation": {
+    "cpp_ctest": {"tests": 14, "failures": 0},
+    "python_relevant_tests": {"tests": 29, "failures": 0},
+    "motor_python_cpp_golden": {"status": "PASS", "control_steps": 5},
+    "d500_python_cpp_golden": {"status": "PASS", "packets": 2, "scans": 1, "bins": 720},
+    "d500_ros_pseudoterminal_smoke": {"status": "PASS", "frame": "d500_lidar", "bins": 720},
+    "backend_selector_none_none": "PASS",
+    "git_diff_check": "PASS"
+  },
+  "hardware_validation": {
+    "d500_real_serial": "PENDING_EXPLICIT_TEST_WINDOW",
+    "motor_gpio": "PENDING_EXPLICIT_MOTOR_PERMISSION",
+    "cpu_matrix": "PENDING_HARDWARE_PARITY"
+  },
+  "frozen_values": {
+    "wheel_radius_m": 0.035,
+    "encoder_cpr": 4606,
+    "wheel_separation_cmd_m": 0.22235,
+    "wheel_separation_odom_m": 0.22235,
+    "lidar_bins": 720,
+    "lidar_frame": "d500_lidar",
+    "map_resolution_m": 0.03
+  }
+}
