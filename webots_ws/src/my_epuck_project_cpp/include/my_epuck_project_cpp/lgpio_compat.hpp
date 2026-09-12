@@ -28,6 +28,7 @@ int lgGpioClaimInput(int handle, int lFlags, int gpio);
 int lgGpioClaimOutput(int handle, int lFlags, int gpio, int level);
 int lgGpioClaimAlert(int handle, int lFlags, int eFlags, int gpio, int nfyHandle);
 int lgGpioSetAlertsFunc(int handle, int gpio, lgGpioAlertsFunc cbf, void * userdata);
+void lgGpioSetSamplesFunc(lgGpioAlertsFunc cbf, void * userdata);
 int lgGpioFree(int handle, int gpio);
 int lgGpioRead(int handle, int gpio);
 int lgGpioWrite(int handle, int gpio, int level);

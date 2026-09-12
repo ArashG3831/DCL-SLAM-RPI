@@ -33,7 +33,9 @@ int QuadratureDecoder::transition_delta(std::uint8_t previous, std::uint8_t curr
 int QuadratureDecoder::process_state(std::uint8_t new_state, std::uint64_t timestamp_ns)
 {
   if (new_state > 3U) throw std::invalid_argument("quadrature state must be 0..3");
-  std::uint8_t previous = state_.exchange(new_state, std::memory_order_acq_rel);
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::uint8_t previous = state_.load(std::memory_order_relaxed);
+  state_.store(new_state, std::memory_order_relaxed);
   const int delta = transition_delta(previous, new_state);
   last_delta_.store(0, std::memory_order_relaxed);
   if (delta == 99) {
@@ -53,7 +55,8 @@ int QuadratureDecoder::process_state(std::uint8_t new_state, std::uint64_t times
 void QuadratureDecoder::initialize_state(std::uint8_t state)
 {
   if (state > 3U) throw std::invalid_argument("quadrature state must be 0..3");
-  state_.store(state, std::memory_order_release);
+  std::lock_guard<std::mutex> lock(mutex_);
+  state_.store(state, std::memory_order_relaxed);
 }
 
 int QuadratureDecoder::process_edge(char channel, std::uint8_t level, std::uint64_t timestamp_ns)
@@ -61,6 +64,13 @@ int QuadratureDecoder::process_edge(char channel, std::uint8_t level, std::uint6
   if ((channel != 'A' && channel != 'B') || level > 1U) {
     throw std::invalid_argument("invalid quadrature edge");
   }
+
+  // Do not use a lock-free read/compare-exchange here.  A and B are delivered
+  // by separate lgpio alert callbacks.  The Python oracle serializes these
+  // callbacks, and that ordering is part of the decoder behavior.  It also
+  // makes count/edge diagnostics coherent when the 20 Hz control thread
+  // snapshots them concurrently.
+  std::lock_guard<std::mutex> lock(mutex_);
   if (channel == 'A') {
     a_edges_.fetch_add(1, std::memory_order_relaxed);
     last_a_ns_.store(timestamp_ns, std::memory_order_relaxed);
@@ -71,32 +81,30 @@ int QuadratureDecoder::process_edge(char channel, std::uint8_t level, std::uint6
 
   // The alert callback for a GPIO line is serialized by lgpio. A compare/exchange
   // still prevents a concurrent snapshot or callback from creating a torn state.
-  std::uint8_t old = state_.load(std::memory_order_acquire);
-  for (;;) {
-    const std::uint8_t next = channel == 'A'
-      ? static_cast<std::uint8_t>((old & 0x1U) | (level << 1U))
-      : static_cast<std::uint8_t>((old & 0x2U) | level);
-    if (state_.compare_exchange_weak(old, next, std::memory_order_acq_rel)) {
-      const int delta = transition_delta(old, next);
-      last_delta_.store(0, std::memory_order_relaxed);
-      if (delta == 99) {
-        invalid_.fetch_add(1, std::memory_order_relaxed);
-        direction_.store(0, std::memory_order_relaxed);
-        return 0;
-      }
-      if (delta == 0) return 0;
-      count_.fetch_add(delta, std::memory_order_relaxed);
-      valid_.fetch_add(1, std::memory_order_relaxed);
-      last_delta_.store(static_cast<std::int8_t>(delta), std::memory_order_relaxed);
-      direction_.store(delta > 0 ? 1 : -1, std::memory_order_relaxed);
-      last_transition_ns_.store(timestamp_ns, std::memory_order_relaxed);
-      return delta;
-    }
+  const std::uint8_t old = state_.load(std::memory_order_relaxed);
+  const std::uint8_t next = channel == 'A'
+    ? static_cast<std::uint8_t>((old & 0x1U) | (level << 1U))
+    : static_cast<std::uint8_t>((old & 0x2U) | level);
+  state_.store(next, std::memory_order_relaxed);
+  const int delta = transition_delta(old, next);
+  last_delta_.store(0, std::memory_order_relaxed);
+  if (delta == 99) {
+    invalid_.fetch_add(1, std::memory_order_relaxed);
+    direction_.store(0, std::memory_order_relaxed);
+    return 0;
   }
+  if (delta == 0) return 0;
+  count_.fetch_add(delta, std::memory_order_relaxed);
+  valid_.fetch_add(1, std::memory_order_relaxed);
+  last_delta_.store(static_cast<std::int8_t>(delta), std::memory_order_relaxed);
+  direction_.store(delta > 0 ? 1 : -1, std::memory_order_relaxed);
+  last_transition_ns_.store(timestamp_ns, std::memory_order_relaxed);
+  return delta;
 }
 
 EncoderSnapshot QuadratureDecoder::snapshot() const
 {
+  std::lock_guard<std::mutex> lock(mutex_);
   const auto state = state_.load(std::memory_order_acquire);
   EncoderSnapshot s;
   s.count = count_.load(std::memory_order_relaxed);
@@ -117,6 +125,7 @@ EncoderSnapshot QuadratureDecoder::snapshot() const
 
 void QuadratureDecoder::reset_counts()
 {
+  std::lock_guard<std::mutex> lock(mutex_);
   count_.store(0, std::memory_order_relaxed);
   valid_.store(0, std::memory_order_relaxed);
   invalid_.store(0, std::memory_order_relaxed);

@@ -1,7 +1,8 @@
 #pragma once
 
-#include <atomic>
 #include <cstdint>
+#include <atomic>
+#include <mutex>
 
 namespace my_epuck_project_cpp {
 
@@ -35,6 +36,11 @@ private:
   int transition_delta(std::uint8_t previous, std::uint8_t current) const;
 
   const int encoder_sign_;
+  // Python's reference decoder serializes every A/B event and every snapshot
+  // with one per-wheel lock.  Keep the same event ordering and make the
+  // diagnostic counters a coherent snapshot.  The lock is intentionally
+  // per wheel, so the encoder hot path never serializes left and right.
+  mutable std::mutex mutex_;
   std::atomic<std::uint8_t> state_;
   std::atomic<std::int64_t> count_{0};
   std::atomic<std::uint64_t> valid_{0};

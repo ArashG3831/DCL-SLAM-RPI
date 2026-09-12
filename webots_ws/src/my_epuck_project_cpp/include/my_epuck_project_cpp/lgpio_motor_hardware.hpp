@@ -20,9 +20,10 @@ public:
   bool valid() const { return handle_ >= 0; }
 
 private:
-  struct Binding { QuadratureDecoder * decoder; char channel; };
-  static void alert_callback(int count, lgGpioAlertPtr alerts, void * userdata);
-  void claim_encoder(int gpio, Binding & binding);
+  struct Binding { QuadratureDecoder * decoder; char channel; int gpio; };
+  static void samples_callback(int count, lgGpioAlertPtr alerts, void * userdata);
+  void claim_encoder_input(int gpio);
+  void claim_encoder_alert(int gpio);
   void claim_output(int gpio);
 
   int handle_{-1};

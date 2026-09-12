@@ -60,10 +60,57 @@ HTML = r"""<!doctype html>
 
     #mapPanel {
       position: relative;
+      z-index: 0;
       flex: 1 1 auto;
       min-height: 0;
       overflow: hidden;
       background: #292d34;
+      pointer-events: none;
+    }
+
+    #comparisonPanel {
+      display: none;
+      position: relative;
+      z-index: 0;
+      flex: 1 1 auto;
+      min-height: 0;
+      gap: 2px;
+      overflow: hidden;
+      background: #101217;
+      pointer-events: none;
+    }
+
+    #comparisonPanel.active { display: flex; }
+
+    .comparisonView {
+      position: relative;
+      flex: 1 1 50%;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      background: #292d34;
+    }
+
+    .comparisonLabel {
+      position: absolute;
+      z-index: 1;
+      top: 5px;
+      left: 6px;
+      padding: 3px 6px;
+      border-radius: 5px;
+      background: rgba(16, 18, 23, 0.78);
+      color: var(--text);
+      font-size: 11px;
+      pointer-events: none;
+    }
+
+    .comparisonView canvas {
+      position: absolute;
+      inset: 0;
+      display: block;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
     }
 
     #mapCanvas {
@@ -72,9 +119,12 @@ HTML = r"""<!doctype html>
       display: block;
       width: 100%;
       height: 100%;
+      pointer-events: none;
     }
 
     #controls {
+      position: relative;
+      z-index: 10;
       flex: 0 0 auto;
       display: flex;
       justify-content: center;
@@ -82,6 +132,7 @@ HTML = r"""<!doctype html>
       padding-bottom: max(8px, env(safe-area-inset-bottom));
       background: var(--panel);
       overflow: hidden;
+      pointer-events: auto;
     }
 
     #controlStack {
@@ -314,6 +365,17 @@ HTML = r"""<!doctype html>
     <canvas id="mapCanvas"></canvas>
   </section>
 
+  <section id="comparisonPanel" aria-label="Live scan matching comparison">
+    <div class="comparisonView">
+      <div class="comparisonLabel">SCAN MATCHING ON</div>
+      <canvas id="comparisonOnCanvas"></canvas>
+    </div>
+    <div class="comparisonView">
+      <div class="comparisonLabel">SCAN MATCHING OFF</div>
+      <canvas id="comparisonOffCanvas"></canvas>
+    </div>
+  </section>
+
   <section id="controls" aria-label="Robot controls">
     <div id="controlStack">
       <div id="speedControl">
@@ -347,29 +409,34 @@ HTML = r"""<!doctype html>
           <span id="lidarHealthLabel">Lidar gap</span>
           <span id="lidarHealthValue">0.00 s</span>
         </div>
-        <button id="w" aria-label="Forward" disabled>▲</button>
+        <button id="w" aria-label="Forward">▲</button>
         <div id="motorSpeed" aria-live="polite">
           <span id="motorSpeedNow">0.0 RPM</span>
           <span id="motorSpeedAvg">Avg 0.0 RPM</span>
         </div>
 
-        <button id="a" aria-label="Spin left" disabled>◀</button>
+        <button id="a" aria-label="Spin left">◀</button>
         <button id="finished" aria-label="Finish odometry test" disabled>FINISHED</button>
-        <button id="d" aria-label="Spin right" disabled>▶</button>
+        <button id="d" aria-label="Spin right">▶</button>
 
         <button id="reset" aria-label="Reset map and odometry test" disabled>RESET</button>
-        <button id="s" aria-label="Reverse" disabled>▼</button>
+        <button id="s" aria-label="Reverse">▼</button>
         <div id="odomResult" aria-live="polite">ODOM TEST
 Waiting for odometry</div>
       </div>
     </div>
-  </section>
+</section>
 </main>
 
 <script>
 const mapPanel = document.getElementById("mapPanel");
 const canvas = document.getElementById("mapCanvas");
 const ctx = canvas.getContext("2d");
+const comparisonPanel = document.getElementById("comparisonPanel");
+const comparisonOnCanvas = document.getElementById("comparisonOnCanvas");
+const comparisonOffCanvas = document.getElementById("comparisonOffCanvas");
+const comparisonOnCtx = comparisonOnCanvas.getContext("2d");
+const comparisonOffCtx = comparisonOffCanvas.getContext("2d");
 const header = document.getElementById("header");
 const speedSlider = document.getElementById("speedSlider");
 const motionButtons = ["w", "a", "s", "d"]
@@ -390,25 +457,42 @@ const mapPixels = document.createElement("canvas");
 const mapPixelsCtx = mapPixels.getContext("2d");
 const mapLayer = document.createElement("canvas");
 const mapLayerCtx = mapLayer.getContext("2d");
+const comparisonOnPixels = document.createElement("canvas");
+const comparisonOnPixelsCtx = comparisonOnPixels.getContext("2d");
+const comparisonOffPixels = document.createElement("canvas");
+const comparisonOffPixelsCtx = comparisonOffPixels.getContext("2d");
 const MAP_POLL_MS = 250;
 const POSE_POLL_MS = 50;
 const MOTOR_AVG_WINDOW_MS = 5000;
 const STARTUP_POLL_MS = 500;
 
 let latestMap = null;
+let latestMapOff = null;
 let trail = [];
+let trailOff = [];
 let trailVersion = 0;
+let trailOffVersion = 0;
 let pressedButtons = new Map();
 let safetyLock = false;
-let commandInterval = null;
 let mapRequestInFlight = false;
+let mapOffRequestInFlight = false;
 let poseRequestInFlight = false;
 let mapLayerKey = null;
+let lastMapRenderAt = 0;
+let lastRenderedMapVersion = null;
+const MAX_TRAIL_RENDER_POINTS = 500;
+const MIN_POSE_RENDER_INTERVAL_MS = 80;
 let motorSpeedSamples = [];
 let controlsReady = false;
 let startupRequestInFlight = false;
 let odomTestState = "WAITING_FOR_ODOM";
 let odomTestMode = "CLOSED_LOOP";
+let comparisonEnabled = false;
+let comparisonOnPixelVersion = null;
+let comparisonOffPixelVersion = null;
+let lastComparisonRenderAt = 0;
+
+let commandInterval = null;
 
 function selectedSpeedRpm() {
   return Number(speedSlider.value);
@@ -444,6 +528,19 @@ function startupText(pending) {
   return "Please wait — initializing " + pending.join(", ") + "…";
 }
 
+function setComparisonEnabled(enabled) {
+  const next = Boolean(enabled);
+  if (comparisonEnabled === next) return;
+  comparisonEnabled = next;
+  mapPanel.style.display = comparisonEnabled ? "none" : "";
+  comparisonPanel.classList.toggle("active", comparisonEnabled);
+  if (comparisonEnabled) {
+    renderComparisonMaps(true);
+  } else if (latestMap) {
+    renderMap(latestMap, true);
+  }
+}
+
 async function updateStartup() {
   if (startupRequestInFlight) return;
   startupRequestInFlight = true;
@@ -451,6 +548,8 @@ async function updateStartup() {
     const response = await fetch("/status?ts=" + Date.now(), {cache: "no-store"});
     const status = await response.json();
     const startup = status.startup || {};
+    const comparison = startup.live_slam_comparison || {};
+    setComparisonEnabled(comparison.enabled === true);
     updateOdomTestStatus(status.odom_test);
     const pending = Array.isArray(startup.pending) ? startup.pending : [];
     if (startup.ready === true) {
@@ -476,14 +575,11 @@ async function send(key, speedRpm = selectedSpeedRpm()) {
   try {
     await fetch(
       "/cmd?key=" + encodeURIComponent(key) + "&speed=" + encodeURIComponent(speedRpm),
-      {
-      cache: "no-store",
-      credentials: "same-origin"
-      }
+      {cache: "no-store", credentials: "same-origin"}
     );
   } catch (error) {
-    // The controller's command timeout stops the robot if the phone loses
-    // connectivity; avoid putting noisy errors on the control screen.
+    // The backend command timeout remains the safety mechanism if the phone
+    // loses connectivity.  Do not block the UI on a failed request.
   }
 }
 
@@ -505,7 +601,6 @@ function refreshMotionCommand() {
     clearInterval(commandInterval);
     commandInterval = null;
   }
-
   const key = safetyLock ? "x" : currentMotionKey();
   const speed = key === "x" ? 0 : selectedSpeedRpm();
   send(key, speed);
@@ -519,7 +614,10 @@ function refreshMotionCommand() {
 
 function pressMotionButton(key, pointerId) {
   if (!controlsReady || pressedButtons.has(key)) return;
-  pressedButtons.set(key, pointerId ?? null);
+  pressedButtons.set(
+    key,
+    pointerId === undefined || pointerId === null ? null : pointerId
+  );
   const keys = Array.from(pressedButtons.keys());
   if (keys.length > 2 || conflictingButtons(keys)) {
     // A conflicting or over-capacity combination is a latched UI safety stop.
@@ -550,10 +648,6 @@ function stop(sendStop = true) {
   }
   pressedButtons.clear();
   safetyLock = false;
-  if (commandInterval !== null) {
-    clearInterval(commandInterval);
-    commandInterval = null;
-  }
   if (sendStop) send("x", 0);
 }
 
@@ -634,7 +728,7 @@ function updateOdomTestStatus(status) {
     if (odomTestMode === "STRAIGHT_STOP") {
       odomResult.textContent =
         "STRAIGHT / STOP\n" +
-        "Runs " + (result.valid_segment_count ?? 0) + "\n" +
+        "Runs " + (result.valid_segment_count == null ? 0 : result.valid_segment_count) + "\n" +
         "Cruise " + formatSigned(result.mean_cruise_yaw_deg) + "°\n" +
         "Stop " + formatSigned(result.mean_stop_yaw_deg) + "°\n" +
         "Worst " + formatNumber(result.max_abs_stop_yaw_deg) + "°";
@@ -695,7 +789,9 @@ for (const key of ["w", "a", "s", "d"]) {
 
   button.addEventListener("pointerdown", (event) => {
     event.preventDefault();
-    button.setPointerCapture(event.pointerId);
+    if (typeof button.setPointerCapture === "function") {
+      button.setPointerCapture(event.pointerId);
+    }
     pressMotionButton(key, event.pointerId);
   });
 
@@ -713,6 +809,7 @@ for (const key of ["w", "a", "s", "d"]) {
   button.addEventListener("lostpointercapture", () => {
     releaseMotionButton(key);
   });
+
 }
 
 finishedButton.addEventListener("pointerdown", async (event) => {
@@ -755,7 +852,6 @@ resetButton.addEventListener("pointerdown", async (event) => {
     setStatus("Map reset unavailable");
   }
 });
-
 window.addEventListener("blur", () => stop(true));
 window.addEventListener("beforeunload", () => stop(true));
 
@@ -768,29 +864,29 @@ function mapToCanvas(point, originX, originY, resolution, height, scale, dx, dy)
   };
 }
 
-function drawPath(path, originX, originY, resolution, height, scale, dx, dy) {
+function drawPath(path, originX, originY, resolution, height, scale, dx, dy, targetCtx = ctx) {
   if (!Array.isArray(path) || path.length < 2) return;
 
-  ctx.save();
-  ctx.beginPath();
-  const stride = Math.max(1, Math.ceil(path.length / 1500));
+  targetCtx.save();
+  targetCtx.beginPath();
+    const stride = Math.max(1, Math.ceil(path.length / MAX_TRAIL_RENDER_POINTS));
   for (let i = 0; i < path.length; i += stride) {
     const point = mapToCanvas(path[i], originX, originY, resolution, height, scale, dx, dy);
-    if (i === 0) ctx.moveTo(point.x, point.y);
-    else ctx.lineTo(point.x, point.y);
+    if (i === 0) targetCtx.moveTo(point.x, point.y);
+    else targetCtx.lineTo(point.x, point.y);
   }
   const last = path[path.length - 1];
   const lastPoint = mapToCanvas(last, originX, originY, resolution, height, scale, dx, dy);
-  ctx.lineTo(lastPoint.x, lastPoint.y);
-  ctx.strokeStyle = "#168cff";
-  ctx.lineWidth = 2.5;
-  ctx.lineJoin = "round";
-  ctx.lineCap = "round";
-  ctx.stroke();
-  ctx.restore();
+  targetCtx.lineTo(lastPoint.x, lastPoint.y);
+  targetCtx.strokeStyle = "#168cff";
+  targetCtx.lineWidth = 2.5;
+  targetCtx.lineJoin = "round";
+  targetCtx.lineCap = "round";
+  targetCtx.stroke();
+  targetCtx.restore();
 }
 
-function drawRobot(robot, originX, originY, resolution, width, height, scale, dx, dy) {
+function drawRobot(robot, originX, originY, resolution, width, height, scale, dx, dy, targetCtx = ctx) {
   if (!robot || !Number.isFinite(robot.x) || !Number.isFinite(robot.y)) return;
 
   const point = mapToCanvas(robot, originX, originY, resolution, height, scale, dx, dy);
@@ -800,21 +896,21 @@ function drawRobot(robot, originX, originY, resolution, width, height, scale, dx
   const y = point.y;
   const size = Math.max(7, Math.min(18, 10 + scale * 0.12));
 
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.rotate(-robot.yaw);
-  ctx.fillStyle = "#e53935";
-  ctx.strokeStyle = "#ffffff";
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(size, 0);
-  ctx.lineTo(-size * 0.8, -size * 0.65);
-  ctx.lineTo(-size * 0.45, 0);
-  ctx.lineTo(-size * 0.8, size * 0.65);
-  ctx.closePath();
-  ctx.fill();
-  ctx.stroke();
-  ctx.restore();
+  targetCtx.save();
+  targetCtx.translate(x, y);
+  targetCtx.rotate(-robot.yaw);
+  targetCtx.fillStyle = "#e53935";
+  targetCtx.strokeStyle = "#ffffff";
+  targetCtx.lineWidth = 2;
+  targetCtx.beginPath();
+  targetCtx.moveTo(size, 0);
+  targetCtx.lineTo(-size * 0.8, -size * 0.65);
+  targetCtx.lineTo(-size * 0.45, 0);
+  targetCtx.lineTo(-size * 0.8, size * 0.65);
+  targetCtx.closePath();
+  targetCtx.fill();
+  targetCtx.stroke();
+  targetCtx.restore();
 }
 
 function buildMapPixels(map, width, height) {
@@ -845,8 +941,148 @@ function buildMapPixels(map, width, height) {
   mapPixels.dataset.version = String(map.version);
 }
 
-function renderMap(map) {
+function buildMapPixelsInto(map, pixels, pixelsCtx) {
+  const width = Number(map.width);
+  const height = Number(map.height);
+  pixels.width = width;
+  pixels.height = height;
+  const image = pixelsCtx.createImageData(width, height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const value = Number(map.data[y * width + x]);
+      const color = value < 0
+        ? 105
+        : value === 0
+        ? 245
+        : Math.max(20, 245 - Math.round(225 * Math.min(100, value) / 100));
+      const dstY = height - 1 - y;
+      const index = (dstY * width + x) * 4;
+      image.data[index] = color;
+      image.data[index + 1] = color;
+      image.data[index + 2] = color;
+      image.data[index + 3] = 255;
+    }
+  }
+  pixelsCtx.putImageData(image, 0, 0);
+}
+
+function validMapForDisplay(map) {
+  return map && map.ok && Number.isInteger(Number(map.width)) &&
+    Number.isInteger(Number(map.height)) && Number(map.width) > 0 &&
+    Number(map.height) > 0 && Number.isFinite(Number(map.resolution)) &&
+    Number(map.resolution) > 0 && Array.isArray(map.data) &&
+    map.data.length === Number(map.width) * Number(map.height);
+}
+
+function renderComparisonMaps(force = false) {
+  if (!comparisonEnabled) return;
+  const now = performance.now();
+  if (!force && now - lastComparisonRenderAt < MIN_POSE_RENDER_INTERVAL_MS) return;
+  lastComparisonRenderAt = now;
+  const onMap = validMapForDisplay(latestMap) ? latestMap : null;
+  const offMap = validMapForDisplay(latestMapOff) ? latestMapOff : null;
+  const maps = [onMap, offMap].filter(Boolean);
+  const bounds = maps.length ? {
+    minX: Math.min(...maps.map((map) => Number(map.origin_x))),
+    minY: Math.min(...maps.map((map) => Number(map.origin_y))),
+    maxX: Math.max(...maps.map((map) => Number(map.origin_x) + Number(map.width) * Number(map.resolution))),
+    maxY: Math.max(...maps.map((map) => Number(map.origin_y) + Number(map.height) * Number(map.resolution))),
+  } : null;
+
+  const views = [
+    {map: onMap, canvas: comparisonOnCanvas, ctx: comparisonOnCtx,
+      pixels: comparisonOnPixels, pixelsCtx: comparisonOnPixelsCtx,
+      version: comparisonOnPixelVersion, on: true},
+    {map: offMap, canvas: comparisonOffCanvas, ctx: comparisonOffCtx,
+      pixels: comparisonOffPixels, pixelsCtx: comparisonOffPixelsCtx,
+      version: comparisonOffPixelVersion, on: false},
+  ];
+
+  for (const view of views) {
+    const rect = view.canvas.parentElement.getBoundingClientRect();
+    const cssWidth = Math.max(1, Math.floor(rect.width));
+    const cssHeight = Math.max(1, Math.floor(rect.height));
+    const dpr = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+    const pixelWidth = Math.max(1, Math.floor(cssWidth * dpr));
+    const pixelHeight = Math.max(1, Math.floor(cssHeight * dpr));
+    if (view.canvas.width !== pixelWidth || view.canvas.height !== pixelHeight) {
+      view.canvas.width = pixelWidth;
+      view.canvas.height = pixelHeight;
+    }
+    view.canvas.style.width = cssWidth + "px";
+    view.canvas.style.height = cssHeight + "px";
+    view.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    view.ctx.clearRect(0, 0, cssWidth, cssHeight);
+    view.ctx.fillStyle = "#292d34";
+    view.ctx.fillRect(0, 0, cssWidth, cssHeight);
+    if (!view.map || !bounds) {
+      view.ctx.fillStyle = "#aeb6c2";
+      view.ctx.font = "12px Arial";
+      view.ctx.textAlign = "center";
+      view.ctx.fillText(view.on ? "Waiting for /map…" : "Waiting for /map_off…", cssWidth / 2, cssHeight / 2);
+      view.ctx.textAlign = "start";
+      continue;
+    }
+    const padding = 8;
+    const worldWidth = Math.max(0.01, bounds.maxX - bounds.minX);
+    const worldHeight = Math.max(0.01, bounds.maxY - bounds.minY);
+    const pixelsPerMeter = Math.max(0.01, Math.min(
+      (cssWidth - 2 * padding) / worldWidth,
+      (cssHeight - 2 * padding) / worldHeight
+    ));
+    const mapWidthM = Number(view.map.width) * Number(view.map.resolution);
+    const mapHeightM = Number(view.map.height) * Number(view.map.resolution);
+    const cellScale = pixelsPerMeter * Number(view.map.resolution);
+    const dx = padding + (Number(view.map.origin_x) - bounds.minX) * pixelsPerMeter;
+    const dy = padding + (bounds.maxY - Number(view.map.origin_y) - mapHeightM) * pixelsPerMeter;
+    const cachedVersion = view.on ? comparisonOnPixelVersion : comparisonOffPixelVersion;
+    if (cachedVersion !== view.map.version || view.pixels.width !== Number(view.map.width) ||
+        view.pixels.height !== Number(view.map.height)) {
+      buildMapPixelsInto(view.map, view.pixels, view.pixelsCtx);
+      if (view.on) comparisonOnPixelVersion = view.map.version;
+      else comparisonOffPixelVersion = view.map.version;
+    }
+    view.ctx.imageSmoothingEnabled = false;
+    view.ctx.drawImage(
+      view.pixels,
+      dx,
+      dy,
+      mapWidthM * pixelsPerMeter,
+      mapHeightM * pixelsPerMeter
+    );
+    view.ctx.strokeStyle = "#6d7480";
+    view.ctx.lineWidth = 1;
+    view.ctx.strokeRect(dx, dy, mapWidthM * pixelsPerMeter, mapHeightM * pixelsPerMeter);
+
+    drawPath(
+      view.on ? trail : trailOff,
+      Number(view.map.origin_x), Number(view.map.origin_y),
+      Number(view.map.resolution), Number(view.map.height),
+      cellScale, dx, dy, view.ctx
+    );
+    drawRobot(
+      view.map.robot,
+      Number(view.map.origin_x), Number(view.map.origin_y),
+      Number(view.map.resolution), Number(view.map.width), Number(view.map.height),
+      cellScale, dx, dy, view.ctx
+    );
+    view.ctx.fillStyle = "#aeb6c2";
+    view.ctx.font = "10px Arial";
+    view.ctx.fillText(
+      `${Number(view.map.width)}×${Number(view.map.height)} | ${mapWidthM.toFixed(1)}×${mapHeightM.toFixed(1)} m`,
+      7, cssHeight - 7
+    );
+  }
+}
+
+function renderMap(map, force = false) {
   if (!map || !map.ok) return;
+
+  const now = performance.now();
+  if (!force && map.version === lastRenderedMapVersion &&
+      now - lastMapRenderAt < MIN_POSE_RENDER_INTERVAL_MS) {
+    return;
+  }
 
   const width = Number(map.width);
   const height = Number(map.height);
@@ -941,6 +1177,8 @@ function renderMap(map) {
     ? ` | pose ${map.robot.x.toFixed(2)}, ${map.robot.y.toFixed(2)} | trail ${trail.length} pts`
     : "";
   setStatus(`${width}×${height} cells | ${mapWidthM.toFixed(2)}×${mapHeightM.toFixed(2)} m | ${resolution.toFixed(3)} m/cell${pose}`);
+  lastMapRenderAt = now;
+  lastRenderedMapVersion = map.version;
 }
 
 async function updateMap() {
@@ -962,7 +1200,8 @@ async function updateMap() {
       const lastRobot = latestMap && latestMap.robot ? latestMap.robot : null;
       latestMap = map;
       if (!latestMap.robot && lastRobot) latestMap.robot = lastRobot;
-      renderMap(map);
+      if (comparisonEnabled) renderComparisonMaps(true);
+      else renderMap(map, true);
     } else {
       setStatus(map.status || "Waiting for /map from slam_toolbox...");
     }
@@ -974,12 +1213,42 @@ async function updateMap() {
   }
 }
 
+async function updateMapOff() {
+  if (!comparisonEnabled) {
+    window.setTimeout(updateMapOff, 1000);
+    return;
+  }
+  if (mapOffRequestInFlight) return;
+  mapOffRequestInFlight = true;
+  try {
+    const knownVersion = latestMapOff ? latestMapOff.version : 0;
+    const response = await fetch(
+      "/map_off.json?version=" + encodeURIComponent(knownVersion) + "&ts=" + Date.now(),
+      {cache: "no-store"}
+    );
+    const map = await response.json();
+    if (!map.unchanged && map.ok) {
+      const lastRobot = latestMapOff && latestMapOff.robot ? latestMapOff.robot : null;
+      latestMapOff = map;
+      if (!latestMapOff.robot && lastRobot) latestMapOff.robot = lastRobot;
+      renderComparisonMaps(true);
+    }
+  } catch (error) {
+    // The ON map and controls remain usable if the diagnostic branch is late.
+  } finally {
+    mapOffRequestInFlight = false;
+    window.setTimeout(updateMapOff, MAP_POLL_MS);
+  }
+}
+
 async function updatePose() {
   if (poseRequestInFlight) return;
   poseRequestInFlight = true;
   try {
     const response = await fetch(
-      "/pose.json?path_from=" + encodeURIComponent(trailVersion) + "&ts=" + Date.now(),
+      "/pose.json?path_from=" + encodeURIComponent(trailVersion) +
+      "&path_off_from=" + encodeURIComponent(trailOffVersion) +
+      "&ts=" + Date.now(),
       {cache: "no-store"}
     );
     const pose = await response.json();
@@ -989,12 +1258,21 @@ async function updatePose() {
     if (pose.path_reset) trail = points;
     else trail = trail.concat(points);
     if (Number.isInteger(pose.path_version)) trailVersion = pose.path_version;
+    const pointsOff = Array.isArray(pose.path_points_off) ? pose.path_points_off : [];
+    if (pose.path_off_reset) trailOff = pointsOff;
+    else trailOff = trailOff.concat(pointsOff);
+    if (Number.isInteger(pose.path_off_version)) trailOffVersion = pose.path_off_version;
     if (latestMap && latestMap.ok && pose.robot) {
       // Never erase a good pose because a transient TF lookup returned no
       // transform.  Keep displaying the last known pose until a newer one
       // arrives.
       latestMap.robot = pose.robot;
-      renderMap(latestMap);
+      if (comparisonEnabled) renderComparisonMaps();
+      else renderMap(latestMap);
+    }
+    if (comparisonEnabled && latestMapOff && latestMapOff.ok && pose.robot_off) {
+      latestMapOff.robot = pose.robot_off;
+      renderComparisonMaps();
     }
   } catch (error) {
     // The map remains visible while a transient pose request fails.
@@ -1035,10 +1313,12 @@ function updateMotorSpeed(rpm) {
 }
 
 window.addEventListener("resize", () => {
-  if (latestMap) renderMap(latestMap);
+  if (comparisonEnabled) renderComparisonMaps(true);
+  else if (latestMap) renderMap(latestMap, true);
 });
 
 updateMap();
+updateMapOff();
 updatePose();
 updateStartup();
 </script>

@@ -278,10 +278,17 @@ class LiveMapState:
         self.map = None
         self.map_json_body = None
         self.map_json_version = None
+        self.map_off = None
+        self.map_off_json_body = None
+        self.map_off_json_version = None
         self.robot = None
+        self.robot_off = None
         self.path = []
+        self.path_off = []
         self.path_base_version = 0
         self.path_version = 0
+        self.path_off_base_version = 0
+        self.path_off_version = 0
         self.version = 0
         self.motor_rpm = {"left": 0.0, "right": 0.0}
         # Do not count lidar startup or pre-map delays. Monitoring begins only
@@ -319,6 +326,27 @@ class LiveMapState:
             self.map_json_body = None
             self.map_json_version = None
 
+    def update_map_off(self, msg):
+        """Store the diagnostic scan-matching-OFF map, when enabled."""
+        width = int(msg.info.width)
+        height = int(msg.info.height)
+        if width <= 0 or height <= 0 or len(msg.data) != width * height:
+            return
+        map_data = list(msg.data)
+        with self.lock:
+            previous_version = self.map_off["version"] if self.map_off else 0
+            self.map_off = {
+                "width": width,
+                "height": height,
+                "resolution": float(msg.info.resolution),
+                "origin_x": float(msg.info.origin.position.x),
+                "origin_y": float(msg.info.origin.position.y),
+                "data": map_data,
+                "version": previous_version + 1,
+            }
+            self.map_off_json_body = None
+            self.map_off_json_version = None
+
     def update_robot(self, transform):
         q = transform.transform.rotation
         yaw = math.atan2(
@@ -348,6 +376,58 @@ class LiveMapState:
                         self.path = self.path[-5000:]
                         self.path_base_version += dropped
             self.robot = pose
+
+    def update_robot_off(self, transform):
+        """Store the diagnostic pose expressed in the map_off frame."""
+        q = transform.transform.rotation
+        yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
+        pose = {
+            "x": float(transform.transform.translation.x),
+            "y": float(transform.transform.translation.y),
+            "yaw": float(yaw),
+        }
+        self._update_robot_off_pose(pose)
+
+    def update_robot_off_from_odom(self, msg):
+        """Track the OFF diagnostic pose directly from raw /odom.
+
+        The OFF mapper is intentionally scan-matching-free, so its map_off
+        frame is expected to coincide with odom.  Using the Odometry message
+        directly keeps the diagnostic trajectory available even if the
+        optional OFF mapper temporarily stops publishing map_off -> odom TF.
+        """
+        pose_msg = msg.pose.pose
+        q = pose_msg.orientation
+        yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
+        self._update_robot_off_pose({
+            "x": float(pose_msg.position.x),
+            "y": float(pose_msg.position.y),
+            "yaw": float(yaw),
+        })
+
+    def _update_robot_off_pose(self, pose):
+        with self.lock:
+            if self.robot_off is None:
+                self.path_off = [pose]
+                self.path_off_base_version = 0
+                self.path_off_version = 1
+            else:
+                dx = pose["x"] - self.robot_off["x"]
+                dy = pose["y"] - self.robot_off["y"]
+                if dx * dx + dy * dy >= 0.001 ** 2:
+                    self.path_off.append(pose)
+                    self.path_off_version += 1
+                    if len(self.path_off) > 5000:
+                        dropped = len(self.path_off) - 5000
+                        self.path_off = self.path_off[-5000:]
+                        self.path_off_base_version += dropped
+            self.robot_off = pose
 
     def update_scan(self):
         now = time.monotonic()
@@ -382,10 +462,17 @@ class LiveMapState:
             self.map = None
             self.map_json_body = None
             self.map_json_version = None
+            self.map_off = None
+            self.map_off_json_body = None
+            self.map_off_json_version = None
             self.robot = None
+            self.robot_off = None
             self.path = []
+            self.path_off = []
             self.path_base_version = 0
             self.path_version = 0
+            self.path_off_base_version = 0
+            self.path_off_version = 0
             self.version = 0
             self.motor_rpm = {"left": 0.0, "right": 0.0}
             self.lidar_monitor_started_at = None
@@ -455,6 +542,29 @@ class LiveMapState:
                     self.map_json_version = self.version
             return body
 
+    def map_off_body(self):
+        """Return the cached diagnostic OFF map JSON body."""
+        with self.map_json_lock:
+            with self.lock:
+                if self.map_off is None:
+                    return None
+                version = self.map_off["version"]
+                if (
+                    self.map_off_json_body is not None
+                    and self.map_off_json_version == version
+                ):
+                    return self.map_off_json_body
+                record = dict(self.map_off)
+            payload = self.display_map_payload(record)
+            body = json.dumps(
+                {"ok": True, **payload}, separators=(",", ":")
+            ).encode("utf-8")
+            with self.lock:
+                if self.map_off is not None and self.map_off["version"] == version:
+                    self.map_off_json_body = body
+                    self.map_off_json_version = version
+            return body
+
     @staticmethod
     def display_map_payload(map_record):
         width = map_record["width"]
@@ -506,7 +616,7 @@ class LiveMapState:
             "display_scale": scale,
         }
 
-    def pose_snapshot(self, requested_path_version):
+    def pose_snapshot(self, requested_path_version, requested_path_off_version=0):
         with self.lock:
             requested_path_version = max(0, int(requested_path_version))
             reset = requested_path_version < self.path_base_version
@@ -515,13 +625,25 @@ class LiveMapState:
             else:
                 start = requested_path_version - self.path_base_version
                 points = list(self.path[max(0, start):])
+            requested_path_off_version = max(0, int(requested_path_off_version))
+            reset_off = requested_path_off_version < self.path_off_base_version
+            if reset_off:
+                points_off = list(self.path_off)
+            else:
+                start_off = requested_path_off_version - self.path_off_base_version
+                points_off = list(self.path_off[max(0, start_off):])
             return {
                 "ok": self.map is not None,
                 "robot": self.robot,
+                "robot_off": self.robot_off,
                 "path_reset": reset,
                 "path_base_version": self.path_base_version,
                 "path_version": self.path_version,
                 "path_points": points,
+                "path_off_reset": reset_off,
+                "path_off_base_version": self.path_off_base_version,
+                "path_off_version": self.path_off_version,
+                "path_points_off": points_off,
                 "map_version": self.version,
                 "lidar": self._lidar_snapshot_locked(time.monotonic()),
                 "motor_rpm": dict(self.motor_rpm),
@@ -534,6 +656,14 @@ class LiveMapState:
     def version_number(self):
         with self.lock:
             return self.version
+
+    def map_off_version_number(self):
+        with self.lock:
+            return self.map_off["version"] if self.map_off is not None else 0
+
+    def has_map_off(self):
+        with self.lock:
+            return self.map_off is not None
 
     def map_snapshot_for_save(self):
         """Return a detached map snapshot for the background file writer."""

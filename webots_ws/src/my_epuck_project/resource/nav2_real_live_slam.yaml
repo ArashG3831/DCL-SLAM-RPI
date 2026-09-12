@@ -43,12 +43,14 @@ controller_server:
 
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 0.11
+      # Robot 2 validation target: 45 RPM ~= 0.165 m/s with 0.035 m wheels;
+      # below the measured low-battery capability of approximately 47 RPM.
+      max_vel_x: 0.165
       max_vel_y: 0.0
       max_vel_theta: 0.65
 
       min_speed_xy: 0.04
-      max_speed_xy: 0.11
+      max_speed_xy: 0.165
       min_speed_theta: 0.40
 
       acc_lim_x: 0.80
@@ -169,7 +171,8 @@ local_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.09
+        # Robot 2 test safety margin: an additional 20% above the previous 0.1350 m.
+        inflation_radius: 0.1620
         cost_scaling_factor: 1.1
 
 global_costmap:
@@ -210,7 +213,8 @@ global_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.09
+        # Robot 2 test safety margin: an additional 20% above the previous 0.1350 m.
+        inflation_radius: 0.1620
         cost_scaling_factor: 1.1
 
 lifecycle_manager_navigation:

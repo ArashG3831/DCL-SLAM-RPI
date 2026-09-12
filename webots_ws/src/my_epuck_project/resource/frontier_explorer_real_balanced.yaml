@@ -42,7 +42,9 @@ frontier_explorer:
     weight_distance_wd: 0.8
     weight_gain_ws: 2.0
 
-    max_linear_speed_vmax: 0.09
+    # Matches the Robot 2 DWB forward cap.  This is used only by the MRTSP
+    # start-node ETA lower-bound term; it does not command motor velocity.
+    max_linear_speed_vmax: 0.165
     max_angular_speed_wmax: 0.65
 
     # -------- Preemption / blocked goals --------

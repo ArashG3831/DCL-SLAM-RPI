@@ -142,13 +142,41 @@ def make_handler(shared, map_state, odom_session, shutdown_event, supervisor, no
                 self.send_body(body, "application/json; charset=utf-8")
                 return
 
-            if parsed.path == "/pose.json":
+            if parsed.path == "/map_off.json":
                 try:
-                    requested = int(parse_qs(parsed.query).get("path_from", ["0"])[0])
+                    known_version = int(parse_qs(parsed.query).get("version", ["0"])[0])
+                except (TypeError, ValueError):
+                    known_version = 0
+                current_version = map_state.map_off_version_number()
+                if current_version > 0 and known_version == current_version:
+                    body = json.dumps({
+                        "ok": True,
+                        "unchanged": True,
+                        "version": current_version,
+                    }).encode("utf-8")
+                    self.send_body(body, "application/json; charset=utf-8")
+                    return
+                body = map_state.map_off_body()
+                if body is None:
+                    body = json.dumps({
+                        "ok": False,
+                        "status": "Waiting for /map_off from slam_toolbox_off...",
+                    }).encode("utf-8")
+                self.send_body(body, "application/json; charset=utf-8")
+                return
+
+            if parsed.path == "/pose.json":
+                query = parse_qs(parsed.query)
+                try:
+                    requested = int(query.get("path_from", ["0"])[0])
                 except (TypeError, ValueError):
                     requested = 0
+                try:
+                    requested_off = int(query.get("path_off_from", ["0"])[0])
+                except (TypeError, ValueError):
+                    requested_off = 0
                 body = json.dumps(
-                    map_state.pose_snapshot(requested),
+                    map_state.pose_snapshot(requested, requested_off),
                     separators=(",", ":"),
                 ).encode("utf-8")
                 self.send_body(body, "application/json; charset=utf-8")
@@ -177,5 +205,3 @@ def make_handler(shared, map_state, odom_session, shutdown_event, supervisor, no
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
-
-

@@ -3,6 +3,9 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <thread>
+
 using namespace my_epuck_project_cpp;
 
 TEST(Quadrature, ForwardReverseAndInvalidParity)
@@ -34,6 +37,40 @@ TEST(Quadrature, EdgeCountersIncludeDuplicatesButNotAsMotion)
   EXPECT_EQ(s.a_edge_count, 2U);
   EXPECT_EQ(s.b_edge_count, 3U);
   EXPECT_EQ(s.invalid_transition_count, 0U);
+}
+
+TEST(Quadrature, ConcurrentABDeliveryKeepsSnapshotCountersCoherent)
+{
+  QuadratureDecoder d(0, 1);
+  std::atomic<bool> go{true};
+
+  // The two GPIO alert callbacks are independent in lgpio.  Exercise the
+  // same concurrent producer shape while repeatedly taking control-thread
+  // snapshots.  The exact decoded direction depends on callback ordering,
+  // but a coherent snapshot must never report more valid+invalid transitions
+  // than the number of delivered A/B edges.
+  std::thread a([&]() {
+    for (int i = 0; i < 20000; ++i) {
+      d.process_edge('A', static_cast<std::uint8_t>(i & 1));
+    }
+  });
+  std::thread b([&]() {
+    for (int i = 0; i < 20000; ++i) {
+      d.process_edge('B', static_cast<std::uint8_t>(i & 1));
+    }
+    go.store(false);
+  });
+  while (go.load()) {
+    const auto s = d.snapshot();
+    EXPECT_LE(
+      s.valid_transition_count + s.invalid_transition_count,
+      s.a_edge_count + s.b_edge_count);
+  }
+  a.join();
+  b.join();
+  const auto s = d.snapshot();
+  EXPECT_EQ(s.a_edge_count + s.b_edge_count, 40000U);
+  EXPECT_LE(s.valid_transition_count + s.invalid_transition_count, 40000U);
 }
 
 TEST(Conversion, CprAndDeadbandAreFrozen)

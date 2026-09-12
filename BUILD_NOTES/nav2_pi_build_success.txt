@@ -1,0 +1,25 @@
+Nav2 built from source on Raspberry Pi / Debian Trixie / ROS 2 Jazzy.
+Core packages found:
+nav2_controller
+nav2_planner
+nav2_bt_navigator
+nav2_behavior_tree
+nav2_behaviors
+nav2_lifecycle_manager
+nav2_costmap_2d
+nav2_velocity_smoother
+nav2_collision_monitor
+nav2_map_server
+nav2_navfn_planner
+nav2_dwb_controller
+
+Optional packages ignored:
+nav2_waypoint_follower
+nav2_bringup
+nav2_system_tests
+nav2_loopback_sim
+docking-related packages
+
+Important patches:
+- nav2_costmap_2d GCC 14 warnings not treated as fatal
+- nav2_behavior_tree BT::NodeExecutionError catch removed due BehaviorTree.CPP API mismatch

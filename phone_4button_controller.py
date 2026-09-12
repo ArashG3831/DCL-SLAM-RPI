@@ -13,13 +13,18 @@ from rclpy.executors import MultiThreadedExecutor
 from phone_controller_config import (
     FORWARD_RPM,
     HTTP_PORT,
+    LIDAR_BACKEND,
+    MOTOR_BACKEND,
     PUB_RATE_HZ,
     SPIN_MAX_RADPS,
+    START_SLAM,
     SLAM_MATCHING_EXPERIMENT_ENABLED,
+    LIVE_SLAM_COMPARISON_ENABLED,
 )
 from phone_controller_http import ReusableThreadingHTTPServer, make_handler
 from phone_controller_ros import PhoneMapNode
 from phone_controller_stack import RobotStackSupervisor
+from phone_runtime_monitor import PhoneRuntimeMonitor
 from phone_controller_state import (
     MapCheckpointSaver,
     LiveMapState,
@@ -56,6 +61,7 @@ def main():
     odom_session = OdomDriftSession(shared, comparison=comparison)
     node = PhoneMapNode(map_state, odom_session)
     supervisor = RobotStackSupervisor()
+    runtime_monitor = PhoneRuntimeMonitor()
     map_saver = MapCheckpointSaver(map_state)
     shutdown_event = threading.Event()
     server = None
@@ -86,6 +92,7 @@ def main():
 
         map_saver.start()
         supervisor.start()
+        runtime_monitor.start()
     except Exception as exc:
         if server is not None:
             try:
@@ -96,6 +103,7 @@ def main():
         if http_thread is not None:
             http_thread.join(timeout=1.0)
         map_saver.stop()
+        runtime_monitor.stop()
         supervisor.stop_owned_children()
         node.destroy_node()
         rclpy.shutdown()
@@ -121,7 +129,14 @@ def main():
     print(f"Forward speed:    {rpm_to_mps(FORWARD_RPM):.3f} m/s")
     print(f"Spin command:     {SPIN_MAX_RADPS:.3f} rad/s")
     print("Live map source:   /map and map -> base_link TF")
-    print("Stack startup:     lidar, motor, lidar TF, and SLAM are supervised")
+    print(
+        "Live SLAM comparison: "
+        + ("ON (/map + /map_off)" if LIVE_SLAM_COMPARISON_ENABLED else "OFF")
+    )
+    print(f"Motor backend:     {MOTOR_BACKEND.upper()}")
+    print(f"Lidar backend:     {LIDAR_BACKEND.upper()}")
+    print("Stack startup:     selected hardware, lidar TF, and SLAM are supervised")
+    print(f"SLAM auto-start:   {'ON' if START_SLAM else 'OFF (external launch)'}")
     print("Disable motor auto-start with: ROBOT1_PHONE_START_MOTOR=0")
     print("Press Ctrl+C to quit.")
     print()
@@ -162,6 +177,7 @@ def main():
             print("Saving final map checkpoint...")
             map_saver.save_now()
             odom_session.shutdown()
+            runtime_monitor.stop()
             supervisor.stop_all_stack_processes()
             PHONE_DIAGNOSTICS.close()
 
