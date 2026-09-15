@@ -56,6 +56,7 @@ def generate_launch_description():
             "minimum_frontier_length_m": 0.05,
             "stable_id_quantization_m": 0.05,
             "approach_clearance_m": 0.06,
+            "frontier_goal_stepback_m": 0.20,
             "planner_tolerance_m": 0.0,
             "minimum_robot_distance_m": 0.08,
             "planner_id": "GridBased",

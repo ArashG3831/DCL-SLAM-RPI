@@ -29,6 +29,7 @@
 #include <my_epuck_interfaces/msg/relative_pose_hypothesis.hpp>
 #include <nav2_msgs/action/compute_path_to_pose.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <tf2_ros/buffer.h>
@@ -276,6 +277,7 @@ public:
     P(double, minimum_frontier_length_m, .05);
     P(double, stable_id_quantization_m, .05);
     P(double, approach_clearance_m, .06);
+    P(double, frontier_goal_stepback_m, 0.0);
     P(double, planner_tolerance_m, .5);
     P(double, minimum_robot_distance_m, .08);
     P(int, maximum_candidates_before_path_check, 8);
@@ -601,7 +603,7 @@ private:
   void log_path_validation(
     const Work & candidate, const GoalHandle::WrappedResult & result,
     const std::optional<double> & length, uint64_t candidate_generation,
-    double duration_s) const
+    double duration_s, const nav_msgs::msg::Path * path_override = nullptr) const
   {
     if (!diagnostic_frontier_capture_ ||
       result.code != rclcpp_action::ResultCode::SUCCEEDED || !result.result ||
@@ -609,7 +611,7 @@ private:
     {
       return;
     }
-    const auto & path = result.result->path;
+    const auto & path = path_override ? *path_override : result.result->path;
     const std::size_t pose_count = path.poses.size();
     std::vector<std::size_t> nonfinite_indices;
     for (std::size_t index = 0; index < path.poses.size(); ++index) {
@@ -739,6 +741,75 @@ private:
     return std::atan2(
       2.0 * (q.w * q.z + q.x * q.y),
       1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+  }
+
+  struct StepBackPath
+  {
+    nav_msgs::msg::Path path;
+    double length{0.0};
+  };
+
+  static std::optional<StepBackPath> step_back_path_pose(
+    const nav_msgs::msg::Path & path, double stepback_m)
+  {
+    if (!std::isfinite(stepback_m) || stepback_m < 0.0 || path.poses.empty()) {
+      return std::nullopt;
+    }
+    double total = 0.0;
+    for (std::size_t i = 1; i < path.poses.size(); ++i) {
+      const auto & a = path.poses[i - 1].pose.position;
+      const auto & b = path.poses[i].pose.position;
+      const double segment = std::hypot(b.x - a.x, b.y - a.y);
+      if (!std::isfinite(segment)) {
+        return std::nullopt;
+      }
+      total += segment;
+    }
+    if (!std::isfinite(total) || total <= stepback_m + 1e-9) {
+      return std::nullopt;
+    }
+    if (stepback_m <= 1e-9) {
+      return StepBackPath{path, total};
+    }
+
+    double remaining = stepback_m;
+    for (std::size_t i = path.poses.size() - 1; i > 0; --i) {
+      const auto & from = path.poses[i - 1].pose;
+      const auto & to = path.poses[i].pose;
+      const double segment = std::hypot(
+        to.position.x - from.position.x, to.position.y - from.position.y);
+      if (segment <= 1e-12) {
+        continue;
+      }
+      if (remaining <= segment + 1e-12) {
+        const double alpha = std::clamp((segment - remaining) / segment, 0.0, 1.0);
+        StepBackPath result;
+        result.path.header = path.header;
+        result.path.poses.assign(path.poses.begin(), path.poses.begin() + i);
+        auto interpolated = from;
+        interpolated.position.x = from.position.x +
+          alpha * (to.position.x - from.position.x);
+        interpolated.position.y = from.position.y +
+          alpha * (to.position.y - from.position.y);
+        const double from_yaw = orientation_yaw(from.orientation);
+        const double to_yaw = orientation_yaw(to.orientation);
+        const double yaw_delta = std::atan2(
+          std::sin(to_yaw - from_yaw), std::cos(to_yaw - from_yaw));
+        const double interpolated_yaw = from_yaw + alpha * yaw_delta;
+        interpolated.orientation.x = 0.0;
+        interpolated.orientation.y = 0.0;
+        interpolated.orientation.z = std::sin(interpolated_yaw / 2.0);
+        interpolated.orientation.w = std::cos(interpolated_yaw / 2.0);
+        geometry_msgs::msg::PoseStamped stamped;
+        stamped.header = path.header;
+        stamped.pose = interpolated;
+        result.path.poses.push_back(std::move(stamped));
+        result.length = total - stepback_m;
+        return result;
+      }
+      remaining -= segment;
+    }
+    return std::nullopt;
   }
 
   static const char * query_failure_class(
@@ -1882,27 +1953,91 @@ private:
         ++cache.query_count;
         const auto duration = std::chrono::duration<double>(
           std::chrono::steady_clock::now() - request_started).count();
-        // Nav2's successful, finite path is the reachability result. Keep the
-        // former endpoint rule only for optional forensic diagnostics; it must
-        // not turn a successful Nav2 plan into PLANNER_FAILED.
-        const auto diagnostic_length = ok ? path_length(
-          result.result->path, rx_, ry_, candidate.pose.pose.position.x,
-          candidate.pose.pose.position.y, goal_tolerance_m_) : std::nullopt;
         auto length = ok ? extract_nav2_path_cost(result.result->path) : std::nullopt;
-        log_path_validation(candidate, result, diagnostic_length, candidate_generation, duration);
+        Work report_candidate = candidate;
+        bool stepback_rejected = false;
         if (length) {
-          if (candidate.tier1_unqueried) {++cycle_tier1_reachable_;}
           auto reachable = candidate;
-          reachable.path = *length;
-          if (selection_policy_ == "frontier_cost_only") {
-            // Cost-only heading is the initial direction of the actual valid
-            // Nav2 path, measured against the robot heading at query time.
-            // Keep the existing approach-pose heading for MRTSP diagnostics.
-            reachable.heading = path_initial_heading_cost(
-              result.result->path, yaw_).value_or(0.0);
+          nav_msgs::msg::Path effective_path = result.result->path;
+          double effective_length = *length;
+          if (frontier_goal_stepback_m_ > 1e-9) {
+            const auto stepped = step_back_path_pose(
+              result.result->path, frontier_goal_stepback_m_);
+            if (!stepped) {
+              stepback_rejected = true;
+              const double planner_length = *length;
+              cache.has_work = false;
+              cache.map_context = candidate.map_context;
+              cache.cost_context = candidate.cost_context;
+              cache.path_map_context = candidate.path_map_context;
+              cache.path_cost_context = candidate.path_cost_context;
+              cache.last_query_ns = now().nanoseconds();
+              cache.cycles_not_queried = 0;
+              cache.classification = "UNREACHABLE_SAFE_APPROACH";
+              cache.last_query_result = "PATH_SHORTER_THAN_STEPBACK";
+              length = std::nullopt;
+              set_region_status(candidate.id, "UNREACHABLE_SAFE_APPROACH");
+              if (candidate.tier1_unqueried) {++cycle_tier1_unreachable_;}
+              count_classification("UNREACHABLE_SAFE_APPROACH");
+              RCLCPP_INFO(
+                get_logger(),
+                "FRONTIER_STEPBACK_REJECTED id=%lu reason=PATH_SHORTER_THAN_STEPBACK "
+                "planner_path_length_m=%.9f stepback_m=%.9f",
+                candidate.id, planner_length, frontier_goal_stepback_m_);
+            } else {
+              effective_path = stepped->path;
+              effective_length = stepped->length;
+              reachable.pose = effective_path.poses.back();
+              reachable.pose.header.frame_id = global_frame_;
+              reachable.pose.header.stamp = now();
+              const double goal_yaw = std::atan2(
+                candidate.region.centroid.second - reachable.pose.pose.position.y,
+                candidate.region.centroid.first - reachable.pose.pose.position.x);
+              reachable.pose.pose.orientation.x = 0.0;
+              reachable.pose.pose.orientation.y = 0.0;
+              reachable.pose.pose.orientation.z = std::sin(goal_yaw / 2.0);
+              reachable.pose.pose.orientation.w = std::cos(goal_yaw / 2.0);
+              reachable.euclid = std::hypot(
+                reachable.pose.pose.position.x - rx_, reachable.pose.pose.position.y - ry_);
+              if (cycle_map_ && cycle_cost_) {
+                frontier_exploration_ros2::OccupancyGrid2d map_grid(cycle_map_);
+                frontier_exploration_ros2::OccupancyGrid2d cost_grid(cycle_cost_);
+                const auto visible = frontier_exploration_ros2::compute_visible_reveal_gain(
+                  reachable.pose.pose, map_grid, cost_grid, std::nullopt,
+                  visible_gain_range_m_, visible_gain_fov_deg_, visible_gain_ray_step_deg_,
+                  candidate.region.visible_reveal_bounds);
+                reachable.gain = visible ? visible->visible_reveal_length_m : 0.0;
+                reachable.map_context = local_context_checksum(
+                  map_grid, candidate.region.centroid.first, candidate.region.centroid.second,
+                  classification_context_radius_m_);
+                reachable.cost_context = local_context_checksum(
+                  cost_grid, reachable.pose.pose.position.x, reachable.pose.pose.position.y,
+                  classification_context_radius_m_);
+                reachable.path_map_context = local_context_checksum(
+                  map_grid, candidate.region.centroid.first, candidate.region.centroid.second,
+                  path_context_radius_m_);
+                reachable.path_cost_context = local_context_checksum(
+                  cost_grid, reachable.pose.pose.position.x, reachable.pose.pose.position.y,
+                  path_context_radius_m_);
+              }
+            }
           }
-          const auto & poses = result.result->path.poses;
+          if (!stepback_rejected) {
+            reachable.path = effective_length;
+            if (selection_policy_ == "frontier_cost_only") {
+              // Cost-only heading is the initial direction of the actual valid
+              // Nav2 path, measured against the robot heading at query time.
+              reachable.heading = path_initial_heading_cost(
+                effective_path, yaw_).value_or(0.0);
+            } else if (frontier_goal_stepback_m_ > 1e-9) {
+              const double final_yaw = orientation_yaw(reachable.pose.pose.orientation);
+              reachable.heading = std::abs(std::atan2(
+                std::sin(final_yaw - yaw_), std::cos(final_yaw - yaw_)));
+            }
+          }
+          const auto & poses = effective_path.poses;
           const std::size_t count = std::min<std::size_t>(32, poses.size());
+          reachable.path_samples.clear();
           reachable.path_samples.reserve(count);
           for (std::size_t i = 0; i < count; ++i) {
             const auto index = count < 2 ? 0 : std::llround(
@@ -1912,20 +2047,41 @@ private:
             point.y = poses[index].pose.position.y;
             reachable.path_samples.push_back(point);
           }
-          cache.work = reachable;
-          cache.has_work = true;
-          cache.map_context = candidate.map_context;
-          cache.cost_context = candidate.cost_context;
-          cache.path_map_context = candidate.path_map_context;
-          cache.path_cost_context = candidate.path_cost_context;
-          cache.last_query_ns = now().nanoseconds();
-          cache.cycles_not_queried = 0;
-          // A successful finite Nav2 path is reachable regardless of its
-          // length.  Distance remains in the candidate/bid cost and route
-          // preference; it is not an ordinary feasibility cutoff.
-          cache.classification = "REACHABLE";
-          set_region_status(candidate.id, "REACHABLE");
-          reachable_.push_back(reachable);
+          if (!stepback_rejected) {
+            if (candidate.tier1_unqueried) {++cycle_tier1_reachable_;}
+            const auto diagnostic_length = path_length(
+              effective_path, rx_, ry_, reachable.pose.pose.position.x,
+              reachable.pose.pose.position.y, goal_tolerance_m_);
+            log_path_validation(
+              reachable, result, diagnostic_length, candidate_generation, duration,
+              &effective_path);
+            cache.work = reachable;
+            cache.has_work = true;
+            cache.map_context = reachable.map_context;
+            cache.cost_context = reachable.cost_context;
+            cache.path_map_context = reachable.path_map_context;
+            cache.path_cost_context = reachable.path_cost_context;
+            cache.last_query_ns = now().nanoseconds();
+            cache.cycles_not_queried = 0;
+            // A successful finite Nav2 path is reachable unless the requested
+            // physical step-back cannot be represented on that same path.
+            cache.classification = "REACHABLE";
+            set_region_status(candidate.id, "REACHABLE");
+            for (auto & diagnostic : region_diagnostics_) {
+              if (diagnostic.id == candidate.id) {
+                diagnostic.approach_x = reachable.pose.pose.position.x;
+                diagnostic.approach_y = reachable.pose.pose.position.y;
+                diagnostic.visible_reveal_gain = reachable.gain;
+                diagnostic.optimistic_cost_lower_bound_s =
+                  std::max(0.0, reachable.euclid - goal_tolerance_m_) /
+                  std::max(cost_only_reference_linear_speed_mps_, 1e-9);
+                diagnostic.has_approach = true;
+              }
+            }
+            report_candidate = reachable;
+            length = effective_length;
+            reachable_.push_back(std::move(reachable));
+          }
         } else {
           if (candidate.tier1_unqueried) {
             if (hard) {++cycle_tier1_unreachable_;} else {++cycle_tier1_aborted_;}
@@ -1948,16 +2104,26 @@ private:
             ++planner_failure_count_;
           }
         }
+        if (stepback_rejected) {
+          report_candidate = candidate;
+          cache.last_query_result = "PATH_SHORTER_THAN_STEPBACK";
+        }
         cache.last_query_result = cache.classification;
+        const auto result_failure_class = [&]() {
+            if (stepback_rejected) {return "UNREACHABLE_SAFE_APPROACH";}
+            return ok ? "PATH_SUCCESS" : (hard ? "CANDIDATE_UNREACHABLE" :
+              query_failure_class(result.code, error_code));
+          }();
         RCLCPP_INFO(
           get_logger(), "FRONTIER_QUERY_RESULT query_id=%lu id=%lu canonical_id=%016lx status=%s action_result=%s failure_class=%s candidate_generation_id=%lu target_x=%.9f target_y=%.9f target_yaw=%.9f goal_frame=%s error_code=%d error_name=%s error_message=\"%s\" duration_s=%.3f path_length_m=%.6f",
-          candidate.query_event_id, candidate.id, candidate.id, cache.classification.c_str(),
+          report_candidate.query_event_id, report_candidate.id, report_candidate.id,
+          cache.classification.c_str(),
           action_result_name(result.code),
-          ok ? "PATH_SUCCESS" : (hard ? "CANDIDATE_UNREACHABLE" :
-          query_failure_class(result.code, error_code)),
-          candidate_generation, candidate.pose.pose.position.x,
-          candidate.pose.pose.position.y, orientation_yaw(candidate.pose.pose.orientation),
-          candidate.pose.header.frame_id.c_str(),
+          result_failure_class,
+          candidate_generation, report_candidate.pose.pose.position.x,
+          report_candidate.pose.pose.position.y,
+          orientation_yaw(report_candidate.pose.pose.orientation),
+          report_candidate.pose.header.frame_id.c_str(),
           error_code, nav2_error_name(error_code),
           result.result ? log_safe(result.result->error_msg).c_str() : "NO_RESULT",
           duration, length.value_or(-1.0));
@@ -2828,7 +2994,7 @@ private:
   uint64_t costing_epoch_id_{0};
   double last_alternative_request_time_s_{-1.0};
   uint8_t last_coordinator_state_{0};
-  double approach_clearance_m_, planner_tolerance_m_, minimum_robot_distance_m_;
+  double approach_clearance_m_, frontier_goal_stepback_m_, planner_tolerance_m_, minimum_robot_distance_m_;
   double path_query_timeout_s_, gain_weight_, distance_weight_;
   double path_weight_, heading_weight_, unreachable_suppression_s_, goal_tolerance_m_;
   double cost_only_reference_linear_speed_mps_, cost_only_reference_angular_speed_radps_;
