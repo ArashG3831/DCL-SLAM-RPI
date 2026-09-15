@@ -1,0 +1,26 @@
+uint8 HARD_UNREACHABLE=0
+uint8 PLANNER_FAILURE=1
+uint8 CONTROLLER_NO_PROGRESS=2
+uint8 DYNAMIC_BLOCKAGE=3
+uint8 TF_OR_LIFECYCLE=4
+uint8 ACTION_REJECTION=5
+uint8 TIMEOUT=6
+uint8 EXPLICIT_CANCELLATION=7
+uint8 UNKNOWN=8
+
+std_msgs/Header header
+string source_robot_id
+unique_identifier_msgs/UUID source_session_id
+string round_id
+string canonical_task_id
+string physical_task_signature
+geometry_msgs/PoseStamped approach_pose
+uint8 failure_class
+float32 path_length_m
+geometry_msgs/Point[] path_samples
+uint32 retry_count
+builtin_interfaces/Duration validity
+string evidence
+uint16 nav2_error_code
+string nav2_error_message
+string nav2_error_name

@@ -1,0 +1,21 @@
+uint8 STARTING=0
+uint8 ACTIVE=1
+uint8 NAVIGATING=2
+uint8 NO_ELIGIBLE_CANDIDATES=3
+uint8 COMPLETE=4
+uint8 STOPPED=5
+uint8 ERROR=6
+
+std_msgs/Header header
+string source_robot_id
+unique_identifier_msgs/UUID source_session_id
+uint64 message_revision
+uint8 state
+uint32 candidate_count
+uint32 eligible_candidate_count
+uint64 active_claim_id
+uint64 active_frontier_id
+uint64 local_map_revision
+uint64 shared_map_checksum
+builtin_interfaces/Duration status_ttl
+string reason

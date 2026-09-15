@@ -1,0 +1,7 @@
+std_msgs/Header header
+string source_robot_id
+string keyframe_id
+uint64 map_epoch
+uint32 descriptor_checksum
+uint32 occupancy_checksum
+nav_msgs/OccupancyGrid occupancy_grid

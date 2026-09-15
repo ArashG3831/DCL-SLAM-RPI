@@ -1,0 +1,61 @@
+std_msgs/Header header
+string source_robot_id
+string target_robot_id
+string source_keyframe_id
+string target_keyframe_id
+geometry_msgs/Transform source_to_target
+float64[36] covariance
+float32 descriptor_similarity
+float32 descriptor_margin
+float32 geometric_inlier_ratio
+float32 reverse_inlier_ratio
+float32 registration_residual_m
+float32 occupied_free_agreement
+float32 overlap_fraction
+float32 temporal_consistency
+float32 final_confidence
+string status
+string rejection_reason
+bool accepted
+string evidence_set_hash
+string[] evidence_source_keyframe_ids
+string[] evidence_target_keyframe_ids
+uint32 constraint_count
+uint32 consistent_constraint_count
+float32 spatial_baseline_m
+float32 angular_spread_rad
+float32 median_registration_residual_m
+float32 p95_registration_residual_m
+float32 projected_error_m
+float32 translation_uncertainty_m
+float32 yaw_uncertainty_rad
+float32 condition_number
+string selector_status
+float64 selector_score
+float64 selector_null_score
+float64 selector_runner_up_score
+float64 selector_runner_up_margin
+float64[] selector_inlier_probabilities
+string physical_evidence_id
+int32 mode_index
+uint32 mode_support
+float64 mode_log_weight
+bool source_viewpoint_available
+float64 source_viewpoint_x
+float64 source_viewpoint_y
+float64 source_viewpoint_yaw
+bool target_viewpoint_available
+float64 target_viewpoint_x
+float64 target_viewpoint_y
+float64 target_viewpoint_yaw
+
+# Stationary witness provenance.  These fields are empty/default for ordinary
+# hypotheses.  They identify the immutable whole-map seed used only to define
+# deterministic disjoint witness support; the seed is never itself proof of
+# the registration.
+string stationary_witness_scheme_version
+string stationary_canonical_source_snapshot_id
+string stationary_canonical_target_snapshot_id
+string stationary_canonical_source_map_hash
+string stationary_canonical_target_map_hash
+float64[3] stationary_canonical_seed

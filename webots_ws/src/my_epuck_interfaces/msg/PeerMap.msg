@@ -1,0 +1,5 @@
+string source_robot_id
+uint64 revision
+builtin_interfaces/Time export_stamp
+bool local_evidence_only
+nav_msgs/OccupancyGrid occupancy_grid

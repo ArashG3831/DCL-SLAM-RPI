@@ -19,9 +19,25 @@
 #include <algorithm>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <thread>
 
 namespace my_epuck_project_cpp {
+
+constexpr std::string_view kDefaultOdomTopic = "/odom";
+constexpr std::string_view kDefaultCmdVelTopic = "/cmd_vel";
+constexpr std::string_view kDefaultCmdVelUnstampedTopic = "/cmd_vel_unstamped";
+constexpr std::string_view kDefaultOdomFrame = "odom";
+constexpr std::string_view kDefaultBaseFrame = "base_link";
+
+// Compile-time regression checks: the existing production launch must retain
+// its root-scoped topics and calibrated bare frame IDs when no overrides are
+// supplied.
+static_assert(kDefaultOdomTopic == "/odom");
+static_assert(kDefaultCmdVelTopic == "/cmd_vel");
+static_assert(kDefaultCmdVelUnstampedTopic == "/cmd_vel_unstamped");
+static_assert(kDefaultOdomFrame == "odom");
+static_assert(kDefaultBaseFrame == "base_link");
 
 class RealDiffDriveNodeCpp : public rclcpp::Node {
 public:
@@ -31,6 +47,16 @@ public:
     declare_parameter("wheel_radius_m", kWheelRadiusM);
     declare_parameter("wheel_separation_cmd_m", kWheelSeparationCmdM);
     declare_parameter("wheel_separation_odom_m", kWheelSeparationOdomM);
+    odom_topic_ = declare_parameter<std::string>(
+      "odom_topic", std::string(kDefaultOdomTopic));
+    cmd_vel_topic_ = declare_parameter<std::string>(
+      "cmd_vel_topic", std::string(kDefaultCmdVelTopic));
+    cmd_vel_unstamped_topic_ = declare_parameter<std::string>(
+      "cmd_vel_unstamped_topic", std::string(kDefaultCmdVelUnstampedTopic));
+    odom_frame_ = declare_parameter<std::string>(
+      "odom_frame", std::string(kDefaultOdomFrame));
+    base_frame_ = declare_parameter<std::string>(
+      "base_frame", std::string(kDefaultBaseFrame));
     declare_parameter("cmd_timeout_s", 0.7);
     declare_parameter("encoder_counts_per_wheel_revolution", kEncoderCpr);
     declare_parameter("safety_enabled", true);
@@ -59,17 +85,17 @@ public:
     core_.set_command_timeout_s(command_timeout_s_);
     core_.configure_safety(read_safety_parameters());
     hardware_ = std::make_unique<LgpioMotorHardware>(left_encoder_, right_encoder_);
-    odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/odom", 10);
+    odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(odom_topic_, 10);
     fault_pub_ = create_publisher<std_msgs::msg::String>(
       "/motor_safety/fault", rclcpp::QoS(1).reliable().transient_local());
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     diagnostic_timer_ = create_wall_timer(std::chrono::seconds(1), [this]() { publish_diagnostics(); });
     cmd_stamped_sub_ = create_subscription<geometry_msgs::msg::TwistStamped>(
-      "/cmd_vel", 10, [this](geometry_msgs::msg::TwistStamped::ConstSharedPtr msg) {
+      cmd_vel_topic_, 10, [this](geometry_msgs::msg::TwistStamped::ConstSharedPtr msg) {
         set_command(msg->twist);
       });
     cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
-      "/cmd_vel_unstamped", 10, [this](geometry_msgs::msg::Twist::ConstSharedPtr msg) {
+      cmd_vel_unstamped_topic_, 10, [this](geometry_msgs::msg::Twist::ConstSharedPtr msg) {
         set_command(*msg);
       });
     RCLCPP_INFO(get_logger(), "real_diffdrive_node_cpp opt-in backend started; Python remains default");
@@ -265,8 +291,8 @@ private:
     const auto stamp = get_clock()->now();
     nav_msgs::msg::Odometry msg;
     msg.header.stamp = stamp;
-    msg.header.frame_id = "odom";
-    msg.child_frame_id = "base_link";
+    msg.header.frame_id = odom_frame_;
+    msg.child_frame_id = base_frame_;
     msg.pose.pose.position.x = output.x;
     msg.pose.pose.position.y = output.y;
     msg.pose.pose.orientation.z = std::sin(output.theta / 2.0);
@@ -279,8 +305,8 @@ private:
 
     geometry_msgs::msg::TransformStamped tf;
     tf.header.stamp = stamp;
-    tf.header.frame_id = "odom";
-    tf.child_frame_id = "base_link";
+    tf.header.frame_id = odom_frame_;
+    tf.child_frame_id = base_frame_;
     tf.transform.translation.x = output.x;
     tf.transform.translation.y = output.y;
     tf.transform.rotation.z = msg.pose.pose.orientation.z;
@@ -309,6 +335,11 @@ private:
   std::atomic<bool> stop_requested_{false};
   std::mutex command_mutex_;
   std::mutex core_mutex_;
+  std::string odom_topic_;
+  std::string cmd_vel_topic_;
+  std::string cmd_vel_unstamped_topic_;
+  std::string odom_frame_;
+  std::string base_frame_;
   double command_linear_{0.0};
   double command_angular_{0.0};
   double command_time_s_{0.0};

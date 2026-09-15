@@ -25,6 +25,20 @@ setup(
     entry_points={
         'console_scripts': [
             'real_diffdrive_node = my_epuck_project.real_diffdrive_node:main',
-            'd500_scan_fix = my_epuck_project.d500_scan_fix:main','twist_stamper = my_epuck_project.twist_stamper:main'],
+            'd500_scan_fix = my_epuck_project.d500_scan_fix:main',
+            'twist_stamper = my_epuck_project.twist_stamper:main',
+            'map_exporter = my_epuck_project.map_exporter:main',
+            'source_aware_map_fusion = my_epuck_project.source_aware_map_fusion:main',
+            'frontier_proposal_adapter = '
+            'my_epuck_project.frontier_proposal_adapter:main',
+            'distributed_frontier_assignment = '
+            'my_epuck_project.distributed_frontier_assignment:main',
+            'minimal_frontier_allocator = '
+            'my_epuck_project.minimal_frontier_allocator:main',
+            'cooperative_experiment_logger = '
+            'my_epuck_project.cooperative_experiment_logger:main',
+            'robot2_resilient_mode_manager = '
+            'my_epuck_project.robot2_resilient_mode_manager:main',
+        ],
     },
 )

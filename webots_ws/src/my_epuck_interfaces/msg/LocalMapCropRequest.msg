@@ -1,0 +1,5 @@
+std_msgs/Header header
+string requester_robot_id
+string source_robot_id
+string keyframe_id
+uint32 descriptor_checksum

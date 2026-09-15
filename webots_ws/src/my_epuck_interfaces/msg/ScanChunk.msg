@@ -1,0 +1,15 @@
+std_msgs/Header header
+string source_robot_id
+uint32 scan_sequence
+uint16 total_chunks
+uint16 chunk_index
+uint32 total_beams
+float32 angle_min
+float32 angle_max
+float32 angle_increment
+float32 time_increment
+float32 scan_time
+float32 range_min
+float32 range_max
+float32[] ranges
+uint32 checksum

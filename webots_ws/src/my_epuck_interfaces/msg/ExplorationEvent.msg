@@ -1,0 +1,17 @@
+std_msgs/Header header
+string source_robot_id
+unique_identifier_msgs/UUID source_session_id
+uint64 event_revision
+string event_type
+uint64 cycle_number
+uint64 claim_id
+uint64 frontier_id
+uint64 candidate_map_revision
+int32 selected_rank
+float32 path_length_m
+float32 information_gain
+geometry_msgs/PoseStamped goal_pose
+string terminal_result
+float32 duration_s
+float32 travelled_distance_m
+string reason

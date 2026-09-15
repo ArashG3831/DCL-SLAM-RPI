@@ -1,0 +1,9 @@
+string canonical_task_id
+bool path_valid
+float32 path_length_m
+float32 estimated_travel_cost
+float32 heading_cost
+float32 own_utility_contribution
+builtin_interfaces/Time task_generation_stamp
+builtin_interfaces/Time path_query_stamp
+geometry_msgs/Point[] path_samples

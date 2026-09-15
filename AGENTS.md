@@ -1,5 +1,9 @@
 # Robot 2 Project Guide for Coding Agents
 
+minimal_frontier_allocator is the only true decentralized task allocator, all
+else are either old or broken.
+use the verified files in /home/robot1/cooperative_migration_source;
+
 This file is durable project guidance for coding agents. It records project
 context, non-obvious invariants, safe commands, and validation conventions. It
 is not a ROS launch file and it does not change runtime behavior by itself.
