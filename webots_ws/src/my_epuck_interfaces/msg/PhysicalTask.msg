@@ -24,6 +24,8 @@ string mrtsp_solver
 bool local_path_valid
 float32 local_path_length_m
 geometry_msgs/Point[] local_path_samples
+# Complete planner result copied from the source FrontierCandidate.
+nav_msgs/Path planned_path
 # Initial direction mismatch of the actual valid Nav2 path, when available.
 # This is a diagnostic/cost-only primitive; MRTSP route context remains
 # represented by the fields above and is not replaced by this value.

@@ -18,6 +18,8 @@ from my_epuck_interfaces.msg import (
     FrontierCandidateArray,
     TaskBidArray,
 )
+from nav2_msgs.action import FollowPath, Spin
+from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
@@ -33,6 +35,8 @@ from .distributed_assignment.local_nav2 import (
     LocalNav2,
     NavigationOutcome,
     classify_dispatch_precondition_failure,
+    classify_follow_path_controller_error,
+    follow_path_controller_error_name,
 )
 from .distributed_assignment.models import FailureClass
 from .mission_termination import CandidateEvidence
@@ -133,8 +137,28 @@ class MinimalFrontierAllocator:
         self._last_solo_snapshot_key = None
         self._solo_preflight_blocked = {}
         self._solo_pending_preflight = None
+        self._solo_preflight_callback = None
+        self._solo_planner_pause_pending = False
+        self._solo_planner_idle = True
+        self._solo_planner_arbitration_enabled = False
         self._solo_active_dispatch = None
         self._solo_evidence_seen = False
+        self._solo_startup_spin_enabled = False
+        self._solo_startup_spin_angle_rad = 0.1745
+        self._solo_startup_spin_started = False
+        self._solo_startup_spin_finished = False
+        self._solo_startup_spin_succeeded = False
+        self._solo_startup_spin_active = False
+        self._solo_startup_spin_waiting_for_snapshot = False
+        self._solo_startup_spin_baseline_stamp_ns = 0
+        self._solo_startup_spin_baseline_generation_id = 0
+        self._solo_startup_spin_client = None
+        self._solo_follow_path_client = None
+        self._solo_follow_path_goal_handle = None
+        self._solo_follow_path_callback = None
+        self._solo_follow_path_started_steady_s = 0.0
+        self._solo_follow_path_start_distance_m = 0.0
+        self._solo_follow_path_cancel_requested = False
 
     def _configure_io(self) -> None:
         declare = self._node.declare_parameter
@@ -155,6 +179,12 @@ class MinimalFrontierAllocator:
             declare('allow_solo_without_peer', False).value)
         self._dispatch_enabled = bool(
             declare('dispatch_enabled', True).value)
+        self._solo_startup_spin_enabled = bool(
+            declare('solo_startup_spin_enabled', False).value)
+        self._solo_startup_spin_angle_rad = float(
+            declare('solo_startup_spin_angle_rad', 0.1745).value)
+        self._solo_planner_arbitration_enabled = bool(
+            declare('pause_planner_queries_while_navigating', False).value)
         self._max_navigation_goals = max(
             0, int(declare('max_navigation_goals', 0).value),
         )
@@ -165,6 +195,15 @@ class MinimalFrontierAllocator:
         self._global_frame = str(
             getattr(self._nav, '_global_frame', 'shared_map'))
         self._solo_mode = self._allow_solo_without_peer
+        if (
+                self._allow_solo_without_peer and
+                self._solo_startup_spin_enabled and
+                self._dispatch_enabled):
+            self._solo_startup_spin_client = ActionClient(
+                self._node, Spin, f'/{self._robot_id}/spin')
+        if self._allow_solo_without_peer and self._dispatch_enabled:
+            self._solo_follow_path_client = ActionClient(
+                self._node, FollowPath, f'/{self._robot_id}/follow_path')
 
         reliable = QoSProfile(
             depth=1,
@@ -219,6 +258,12 @@ class MinimalFrontierAllocator:
             f'/{self._peer_id}/distributed_status',
             self.on_peer_status,
             reliable,
+        )
+        self._node.create_subscription(
+            DistributedExplorationEvent,
+            f'/{self._robot_id}/distributed_event',
+            self.on_local_event,
+            event_qos,
         )
         self._node.create_subscription(
             DistributedExplorationEvent,
@@ -305,6 +350,135 @@ class MinimalFrontierAllocator:
             return False
         return bool(nav2_healthy and tf_healthy)
 
+    def _solo_startup_spin_required(self) -> bool:
+        """Return whether this physical solo run needs the one-shot spin."""
+        return bool(
+            self._allow_solo_without_peer and self._solo_mode and
+            self._solo_startup_spin_enabled and self._dispatch_enabled)
+
+    def _finish_solo_startup_spin(self, succeeded: bool, reason: str) -> None:
+        self._solo_startup_spin_active = False
+        self._solo_startup_spin_finished = True
+        self._solo_startup_spin_succeeded = bool(succeeded)
+        self._solo_startup_spin_waiting_for_snapshot = bool(succeeded)
+        self._allocation_reason = reason
+        self._log_info(
+            'MINIMAL_ALLOCATOR_SOLO_STARTUP_SPIN_RESULT '
+            f'robot={self._robot_id} succeeded={bool(succeeded)} '
+            f'reason={reason}',
+        )
+        self._publish_status()
+
+    def _on_solo_startup_spin_result(self, future) -> None:
+        try:
+            wrapped = future.result()
+            status = int(getattr(wrapped, 'status', 0))
+            result = getattr(wrapped, 'result', None)
+            error_code = int(getattr(result, 'error_code', 0))
+            succeeded = (
+                status == GoalStatus.STATUS_SUCCEEDED and error_code == 0)
+            reason = (
+                'solo startup spin succeeded' if succeeded else
+                f'solo startup spin failed status={status} '
+                f'error_code={error_code} '
+                f'error_msg={getattr(result, "error_msg", "")}'
+            )
+        except Exception as exc:  # noqa: B902 - action result is fail-closed
+            self._finish_solo_startup_spin(
+                False, f'solo startup spin result error: {exc}')
+            return
+        self._finish_solo_startup_spin(succeeded, reason)
+
+    def _on_solo_startup_spin_goal_response(self, future) -> None:
+        try:
+            goal_handle = future.result()
+        except Exception as exc:  # noqa: B902 - action response is fail-closed
+            self._finish_solo_startup_spin(
+                False, f'solo startup spin goal error: {exc}')
+            return
+        if goal_handle is None or not goal_handle.accepted:
+            self._finish_solo_startup_spin(
+                False, 'solo startup spin goal rejected')
+            return
+        try:
+            result_future = goal_handle.get_result_async()
+            result_future.add_done_callback(self._on_solo_startup_spin_result)
+        except Exception as exc:  # noqa: B902 - action result is fail-closed
+            self._finish_solo_startup_spin(
+                False, f'solo startup spin result setup error: {exc}')
+
+    def _start_solo_startup_spin(self) -> None:
+        if self._solo_startup_spin_started:
+            return
+        if not self._solo_nav_readiness_is_current():
+            self._allocation_reason = 'waiting for Nav2 readiness before solo startup spin'
+            return
+        client = self._solo_startup_spin_client
+        if client is None:
+            self._allocation_reason = 'solo startup spin action client unavailable'
+            return
+        try:
+            if not client.server_is_ready():
+                self._allocation_reason = 'waiting for /robot2/spin action server'
+                return
+            goal = Spin.Goal()
+            goal.target_yaw = float(self._solo_startup_spin_angle_rad)
+            goal.time_allowance.sec = 10
+            goal.time_allowance.nanosec = 0
+            # The spin is the bootstrap that makes the first candidate
+            # snapshot possible; it must be sent after Nav2 readiness, before
+            # requiring a candidate for allocation.  If a snapshot already
+            # exists, retain it as the pre-spin baseline so it is not reused
+            # after the spin completes.  A candidate-free startup simply uses
+            # a zero baseline and accepts the first valid post-spin snapshot.
+            baseline = self._candidates.get(self._robot_id)
+            if baseline is None:
+                self._solo_startup_spin_baseline_stamp_ns = 0
+                self._solo_startup_spin_baseline_generation_id = 0
+            else:
+                self._solo_startup_spin_baseline_stamp_ns = (
+                    self._message_stamp_ns(baseline))
+                self._solo_startup_spin_baseline_generation_id = int(
+                    getattr(baseline, 'candidate_generation_id', 0))
+            self._solo_startup_spin_started = True
+            self._solo_startup_spin_active = True
+            self._allocation_reason = 'solo startup spin active'
+            self._log_info(
+                'MINIMAL_ALLOCATOR_SOLO_STARTUP_SPIN_SENT '
+                f'robot={self._robot_id} action=/{self._robot_id}/spin '
+                f'angle_rad={float(goal.target_yaw):.4f} '
+                'collision_checks=enabled',
+            )
+            future = client.send_goal_async(goal)
+            future.add_done_callback(self._on_solo_startup_spin_goal_response)
+        except Exception as exc:  # noqa: B902 - startup motion is fail-closed
+            self._finish_solo_startup_spin(
+                False, f'solo startup spin setup error: {exc}')
+
+    def _solo_startup_spin_ready_for_snapshot(
+            self, message: FrontierCandidateArray) -> bool:
+        """Gate the first solo evaluation behind one completed map spin."""
+        if not self._solo_startup_spin_required():
+            return True
+        if not self._solo_startup_spin_started:
+            self._start_solo_startup_spin()
+            return False
+        if self._solo_startup_spin_active or not self._solo_startup_spin_finished:
+            return False
+        if not self._solo_startup_spin_succeeded:
+            return False
+        if self._solo_startup_spin_waiting_for_snapshot:
+            stamp_ns = self._message_stamp_ns(message)
+            generation_id = int(getattr(message, 'candidate_generation_id', 0))
+            if (
+                    stamp_ns <= self._solo_startup_spin_baseline_stamp_ns and
+                    generation_id <= self._solo_startup_spin_baseline_generation_id):
+                return False
+            self._solo_startup_spin_waiting_for_snapshot = False
+            self._allocation_reason = (
+                'solo startup spin complete; updated snapshot received')
+        return True
+
     def _local_status_evidence(self) -> CandidateEvidence:
         return self._evidence[self._robot_id]
 
@@ -377,6 +551,9 @@ class MinimalFrontierAllocator:
         self._goal_token += 1
         self._active_goal_id = None
         self._solo_pending_preflight = None
+        self._solo_preflight_callback = None
+        self._solo_planner_pause_pending = False
+        self._solo_planner_idle = True
         self._traffic_decision = None
         self._state = self.EVALUATING if self._released else self.IDLE
 
@@ -692,6 +869,8 @@ class MinimalFrontierAllocator:
             return
         if not self._solo_nav_readiness_is_current():
             return
+        if not self._solo_follow_path_server_ready():
+            return
         inputs_ready = getattr(self._nav, 'preflight_inputs_available', None)
         if callable(inputs_ready) and not inputs_ready():
             return
@@ -746,6 +925,8 @@ class MinimalFrontierAllocator:
             return
         local = self._candidates[self._robot_id]
         if local is None:
+            return
+        if not self._solo_startup_spin_ready_for_snapshot(local):
             return
         snapshot_key = self._solo_snapshot_key(local)
         if (snapshot_key == self._last_solo_snapshot_key and
@@ -859,6 +1040,10 @@ class MinimalFrontierAllocator:
                 self._solo_mode = True
         if (self._allow_solo_without_peer and self._solo_mode and
                 source == self._robot_id):
+            if not self._solo_startup_spin_ready_for_snapshot(message):
+                self._state = self.EVALUATING if self._released else self.IDLE
+                self._publish_status()
+                return
             self._try_allocate_solo()
             self._maybe_solo_terminal()
             return
@@ -1040,6 +1225,8 @@ class MinimalFrontierAllocator:
     def _try_allocate(self) -> None:
         if not self._released:
             return
+        if getattr(self, '_solo_startup_spin_active', False):
+            return
         if self._terminal_reason is not None:
             return
         if self._union is None or self._local_batch is None:
@@ -1160,6 +1347,9 @@ class MinimalFrontierAllocator:
             return
         task = _retry_task or navigation.to_physical_task(
             candidate, self._robot_id)
+        if self._allow_solo_without_peer and self._solo_mode:
+            task = replace(
+                task, planned_path=getattr(candidate, 'planned_path', None))
         pending_union_hash = self._union.union_hash if self._union else ''
         pending_task_id = str(candidate.frontier_id)
         dispatch_path = tuple(path)
@@ -1177,12 +1367,14 @@ class MinimalFrontierAllocator:
                     self._state != self.GOAL_PENDING):
                 return
         self._local_batch = self._passive_batch_for(self._union)
-        self._publish_batch()
-        self._publish_status()
         send_started = False
         if self._allow_solo_without_peer and self._solo_mode:
             self._solo_pending_preflight = (
                 candidate, task, dispatch_path, token)
+            if (_retry_token is None and getattr(
+                    self, '_solo_planner_arbitration_enabled', False)):
+                self._solo_planner_pause_pending = True
+                self._solo_planner_idle = False
 
         def precondition_result(result: DispatchPreconditions) -> None:
             nonlocal send_started
@@ -1205,9 +1397,17 @@ class MinimalFrontierAllocator:
                 return
             if send_started:
                 return
+            solo_rejection = (
+                self._allow_solo_without_peer and self._solo_mode)
+            if solo_rejection and result.ready and not self._solo_follow_path_server_ready():
+                self._solo_pending_preflight = (
+                    candidate, task, tuple(dispatch_path), token)
+                self._allocation_reason = (
+                    'solo preflight retryable: FollowPath action server unavailable')
+                self._state = self.GOAL_PENDING
+                self._publish_status()
+                return
             if not result.ready:
-                solo_rejection = (
-                    self._allow_solo_without_peer and self._solo_mode)
                 geometry_reason = (
                     self._solo_geometry_rejection_reason(result)
                     if solo_rejection else '')
@@ -1242,12 +1442,16 @@ class MinimalFrontierAllocator:
             send_started = True
             self._state = self.NAVIGATING
             self._publish_status()
-            sent = navigation.send(
-                self._nav,
-                task,
-                lambda outcome: self.on_navigation_outcome(token, outcome),
-                dispatch_path,
-            )
+            if self._allow_solo_without_peer and self._solo_mode:
+                sent = self._send_solo_follow_path(
+                    task, lambda outcome: self.on_navigation_outcome(token, outcome))
+            else:
+                sent = navigation.send(
+                    self._nav,
+                    task,
+                    lambda outcome: self.on_navigation_outcome(token, outcome),
+                    dispatch_path,
+                )
             if sent:
                 self._navigation_goal_count += 1
                 if self._allow_solo_without_peer and self._solo_mode:
@@ -1263,6 +1467,12 @@ class MinimalFrontierAllocator:
                 )
             if not sent:
                 self._clear_goal(token)
+
+        if (self._allow_solo_without_peer and self._solo_mode and
+                getattr(self, '_solo_planner_arbitration_enabled', False)):
+            self._solo_preflight_callback = precondition_result
+        self._publish_batch()
+        self._publish_status()
 
         if (not self._allow_solo_without_peer or
                 not self._solo_mode):
@@ -1286,9 +1496,132 @@ class MinimalFrontierAllocator:
             return
 
         # Solo mode trusts the candidate generator's completed
-        # ComputePathToPose result.  Keep only the readiness needed to submit
-        # NavigateToPose; Nav2/RPP owns live collision and footprint handling.
+        # completed generator path result.  Keep only the readiness needed to submit
+        # FollowPath; Nav2/RPP owns live collision and footprint handling.
+        if (getattr(self, '_solo_planner_arbitration_enabled', False) and
+                not self._solo_planner_idle):
+            self._log_info(
+                'MINIMAL_ALLOCATOR_WAITING_FOR_PLANNER_IDLE '
+                f'task_id={pending_task_id}')
+            return
         self._nav.check_navigation_readiness(precondition_result)
+
+    def on_local_event(self, message: DistributedExplorationEvent) -> None:
+        if (
+                message.source_robot_id != self._robot_id or
+                message.event_type != 'PLANNER_QUERY_IDLE' or
+                not self._solo_planner_pause_pending or
+                self._active_goal_id is None or
+                self._state != self.GOAL_PENDING):
+            return
+        self._solo_planner_idle = True
+        callback = self._solo_preflight_callback
+        self._solo_preflight_callback = None
+        self._log_info(
+            'MINIMAL_ALLOCATOR_PLANNER_IDLE_ACK '
+            f'reason={message.reason or "unspecified"}')
+        if callback is not None:
+            self._nav.check_navigation_readiness(callback)
+
+    def _solo_follow_path_server_ready(self) -> bool:
+        client = getattr(self, '_solo_follow_path_client', None)
+        return bool(client is not None and client.server_is_ready())
+
+    def _solo_follow_path_result(
+            self, accepted: bool, status: int, error_code: int,
+            error_message: str = '') -> None:
+        callback = self._solo_follow_path_callback
+        self._solo_follow_path_callback = None
+        self._solo_follow_path_goal_handle = None
+        duration = max(
+            0.0, time.monotonic() - self._solo_follow_path_started_steady_s)
+        current_distance = float(getattr(
+            self._nav, 'travelled_distance_m',
+            self._solo_follow_path_start_distance_m))
+        travelled = max(
+            0.0, current_distance - self._solo_follow_path_start_distance_m)
+        succeeded = (
+            accepted and status == GoalStatus.STATUS_SUCCEEDED and
+            int(error_code) == int(FollowPath.Result.NONE))
+        failure_class = (
+            FailureClass.UNKNOWN if succeeded else
+            classify_follow_path_controller_error(error_code))
+        error_name = follow_path_controller_error_name(error_code)
+        outcome = NavigationOutcome(
+            bool(accepted), int(status), int(error_code), str(error_message),
+            failure_class, duration, travelled, 0,
+            error_name, int(error_code), error_name,
+            'CONTROLLER_EXECUTION' if not succeeded and error_name else '',
+            error_name if not succeeded and error_name else '',
+            self._node.get_clock().now().nanoseconds,
+            '',
+        )
+        if callback is not None:
+            callback(outcome)
+
+    def _solo_follow_path_goal_response(self, future) -> None:
+        try:
+            goal_handle = future.result()
+        except Exception as error:  # noqa: B902
+            self._solo_follow_path_result(
+                False, GoalStatus.STATUS_UNKNOWN, 0,
+                'FollowPath goal response exception: ' + str(error))
+            return
+        if goal_handle is None or not goal_handle.accepted:
+            self._solo_follow_path_result(
+                False, GoalStatus.STATUS_UNKNOWN, 0,
+                'FollowPath goal rejected')
+            return
+        self._solo_follow_path_goal_handle = goal_handle
+        if self._solo_follow_path_cancel_requested:
+            goal_handle.cancel_goal_async()
+        try:
+            result_future = goal_handle.get_result_async()
+            result_future.add_done_callback(self._solo_follow_path_result_done)
+        except Exception as error:  # noqa: B902
+            self._solo_follow_path_result(
+                True, GoalStatus.STATUS_UNKNOWN, 0,
+                'FollowPath result setup exception: ' + str(error))
+
+    def _solo_follow_path_result_done(self, future) -> None:
+        try:
+            wrapped = future.result()
+            result = wrapped.result
+            self._solo_follow_path_result(
+                True, int(wrapped.status), int(result.error_code),
+                str(result.error_msg))
+        except Exception as error:  # noqa: B902
+            self._solo_follow_path_result(
+                True, GoalStatus.STATUS_UNKNOWN, 0,
+                'FollowPath result exception: ' + str(error))
+
+    def _send_solo_follow_path(self, task, callback) -> bool:
+        client = getattr(self, '_solo_follow_path_client', None)
+        planned_path = getattr(task, 'planned_path', None)
+        if (
+                client is None or not client.server_is_ready() or
+                planned_path is None or not planned_path.poses):
+            return False
+        goal = FollowPath.Goal()
+        goal.path = planned_path
+        goal.controller_id = 'FollowPath'
+        goal.goal_checker_id = 'goal_checker'
+        goal.progress_checker_id = 'progress_checker'
+        self._solo_follow_path_callback = callback
+        self._solo_follow_path_started_steady_s = time.monotonic()
+        self._solo_follow_path_start_distance_m = float(getattr(
+            self._nav, 'travelled_distance_m', 0.0))
+        self._solo_follow_path_cancel_requested = False
+        future = client.send_goal_async(goal)
+        future.add_done_callback(self._solo_follow_path_goal_response)
+        self._log_info(
+            'MINIMAL_ALLOCATOR_SOLO_FOLLOW_PATH_SENT '
+            f'poses={len(planned_path.poses)} '
+            f'frame={planned_path.header.frame_id} '
+            f'controller_id={goal.controller_id} '
+            f'goal_checker_id={goal.goal_checker_id} '
+            f'progress_checker_id={goal.progress_checker_id}')
+        return True
 
     def _navigation_goal_cap_reached(self) -> bool:
         limit = int(getattr(self, '_max_navigation_goals', 0))
@@ -1366,6 +1699,9 @@ class MinimalFrontierAllocator:
             self._solo_pending_preflight = None
         self._active_goal_id = None
         self._active_goal_union_hash = None
+        self._solo_preflight_callback = None
+        self._solo_planner_pause_pending = False
+        self._solo_planner_idle = True
         self._traffic_decision = None
         self._state = self.EVALUATING if self._released else self.IDLE
         self._local_batch = None
@@ -1375,6 +1711,12 @@ class MinimalFrontierAllocator:
     def cancel_active(self) -> bool:
         if self._nav is None or self._active_goal_id is None:
             return False
+        if self._allow_solo_without_peer and self._solo_mode:
+            self._solo_follow_path_cancel_requested = True
+            if self._solo_follow_path_goal_handle is not None:
+                self._solo_follow_path_goal_handle.cancel_goal_async()
+                return True
+            return True
         return navigation.cancel(self._nav)
 
     def _maybe_terminal(self) -> None:
@@ -1422,6 +1764,11 @@ class MinimalFrontierAllocator:
                 not self._solo_evidence_is_fresh() or
                 not self._solo_nav_readiness_is_current()):
             return
+        if (
+                self._solo_startup_spin_required() and
+                not self._solo_startup_spin_ready_for_snapshot(
+                    self._candidates[self._robot_id])):
+            return
         classified = termination.classify(
             self._evidence[self._robot_id],
             CandidateEvidence(),
@@ -1466,6 +1813,9 @@ class MinimalFrontierAllocator:
 
     def _tick(self) -> None:
         self._update_peer_presence()
+        if (self._solo_startup_spin_required() and
+                not self._solo_startup_spin_started):
+            self._start_solo_startup_spin()
         self._maybe_solo_terminal()
         self._maybe_terminal()
         if self._solo_pending_preflight is not None:

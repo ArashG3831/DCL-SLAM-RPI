@@ -106,6 +106,7 @@ def task_from_msg(message: PhysicalTaskMsg) -> PhysicalTask:
         local_path_length_m=message.local_path_length_m,
         local_path=tuple((point.x, point.y)
                          for point in message.local_path_samples),
+        planned_path=getattr(message, 'planned_path', None),
         path_heading_cost_rad=message.path_heading_cost_rad,
         generation_ros_ns=stamp.sec * 1_000_000_000 + stamp.nanosec,
     )

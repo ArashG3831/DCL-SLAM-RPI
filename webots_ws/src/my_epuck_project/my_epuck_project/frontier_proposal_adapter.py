@@ -169,6 +169,7 @@ class FrontierProposalAdapter(Node):
             task.local_path_valid = candidate.reachability_state == candidate.REACHABLE
             task.local_path_length_m = candidate.local_path_length_m or candidate.path_length_m
             task.local_path_samples = list(candidate.local_path_samples)
+            task.planned_path = candidate.planned_path
             task.path_heading_cost_rad = candidate.heading_change_rad
             task.generation_stamp = candidates.header.stamp
             message.tasks.append(task)

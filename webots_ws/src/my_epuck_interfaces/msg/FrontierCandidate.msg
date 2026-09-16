@@ -21,6 +21,8 @@ string mrtsp_solver
 uint8 reachability_state
 float32 local_path_length_m
 geometry_msgs/Point[] local_path_samples
+# Complete planner result used by the physical solo FollowPath path.
+nav_msgs/Path planned_path
 # Stable physical identity computed from frontier geometry in the local map.
 # It is not a transient array index and is valid for diagnostic/task matching.
 uint64 physical_frontier_id

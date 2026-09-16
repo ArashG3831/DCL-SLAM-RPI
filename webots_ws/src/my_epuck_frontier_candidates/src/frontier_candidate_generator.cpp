@@ -23,11 +23,13 @@
 #include <vector>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <my_epuck_interfaces/msg/distributed_exploration_event.hpp>
 #include <my_epuck_interfaces/msg/distributed_exploration_status.hpp>
 #include <my_epuck_interfaces/msg/frontier_candidate.hpp>
 #include <my_epuck_interfaces/msg/frontier_candidate_array.hpp>
 #include <my_epuck_interfaces/msg/relative_pose_hypothesis.hpp>
 #include <nav2_msgs/action/compute_path_to_pose.hpp>
+#include <nav2_msgs/srv/is_path_valid.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -86,6 +88,7 @@ void append_region_cells_fingerprint(std::ostringstream & output, const Region &
 class Generator : public rclcpp::Node {
   using Action = nav2_msgs::action::ComputePathToPose;
   using GoalHandle = rclcpp_action::ClientGoalHandle<Action>;
+  using PathValid = nav2_msgs::srv::IsPathValid;
   static constexpr std::chrono::duration<double> kLocalContextTolerance{0.500};
 
   enum class TimingSection {
@@ -177,6 +180,7 @@ class Generator : public rclcpp::Node {
     double score{0.0};
     uint32_t mrtsp_route_rank{std::numeric_limits<uint32_t>::max()};
     uint64_t mrtsp_route_generation{0};
+    nav_msgs::msg::Path planned_path;
     std::vector<geometry_msgs::msg::Point> path_samples;
     uint64_t map_context{0};
     uint64_t cost_context{0};
@@ -247,6 +251,7 @@ public:
     P(std::string, global_frame, "shared_map");
     P(std::string, robot_base_frame, "base_footprint");
     P(std::string, compute_path_action, "compute_path_to_pose");
+    P(std::string, path_valid_service, "");
     P(std::string, candidate_topic, "frontier_candidates");
     P(std::string, marker_topic, "frontier_candidate_markers");
     P(std::string, path_query_lock_path, "");
@@ -261,9 +266,11 @@ public:
     P(bool, handoff_gated, false);
     P(bool, stop_after_handoff, false);
     P(bool, event_driven_costing, false);
+    P(bool, pause_planner_queries_while_navigating, false);
     // Physical solo fallback only. The simulator/cooperative default remains
     // the authoritative costmap-based search when this is false.
     P(bool, require_known_approach, false);
+    P(bool, path_valid_preflight_enabled, false);
     P(int, occupied_threshold, 50);
     P(int, costmap_blocked_threshold, 1);
     // Use the pinned upstream decision-map pipeline as a private frontier
@@ -321,6 +328,9 @@ public:
     if (robot_id_.empty()) {
       throw std::runtime_error("robot_id must be configured");
     }
+    if (path_valid_service_.empty()) {
+      path_valid_service_ = "/" + robot_id_ + "/is_path_valid";
+    }
     if (selection_policy_ != "frontier_cost_only" &&
         selection_policy_ != "frontier_mrtsp") {
       throw std::runtime_error(
@@ -370,9 +380,19 @@ public:
       candidate_topic_, rclcpp::QoS(1).reliable());
     marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
       marker_topic_, rclcpp::QoS(1).reliable());
+    if (pause_planner_queries_while_navigating_) {
+      planner_event_pub_ = create_publisher<my_epuck_interfaces::msg::DistributedExplorationEvent>(
+        "/" + robot_id_ + "/distributed_event", rclcpp::QoS(50).reliable());
+    }
     initialize_upstream_core();
     planner_ = rclcpp_action::create_client<Action>(this, compute_path_action_);
-    if (event_driven_costing_) {
+    if (path_valid_preflight_enabled_) {
+      path_valid_client_ = create_client<PathValid>(path_valid_service_);
+      RCLCPP_INFO(
+        get_logger(), "generator-side IsPathValid enabled service=%s",
+        path_valid_service_.c_str());
+    }
+    if (event_driven_costing_ || pause_planner_queries_while_navigating_) {
       auto status_qos = rclcpp::QoS(rclcpp::KeepLast(1));
       status_qos.reliable().transient_local();
       coordinator_status_subscription_ =
@@ -1020,6 +1040,10 @@ private:
 
   void tick()
   {
+    if (navigation_paused_) {
+      state_ = State::IDLE;
+      return;
+    }
     if (state_ == State::PATH_CHECKING || state_ == State::EXTRACTING ||
       state_ == State::PUBLISHING) {return;}
     nav_msgs::msg::OccupancyGrid::ConstSharedPtr map, costmap;
@@ -1077,6 +1101,29 @@ private:
     }
   }
 
+  void publish_planner_idle_ack(const char * reason)
+  {
+    if (!pause_planner_queries_while_navigating_ ||
+      !navigation_paused_ || planner_idle_ack_published_ ||
+      active_request_.load() != 0 || active_ || !planner_event_pub_)
+    {
+      return;
+    }
+    my_epuck_interfaces::msg::DistributedExplorationEvent event;
+    event.header.stamp = get_clock()->now();
+    event.header.frame_id = global_frame_;
+    event.source_robot_id = robot_id_;
+    event.event_type = "PLANNER_QUERY_IDLE";
+    event.previous_state = "PATH_CHECKING";
+    event.next_state = "IDLE";
+    event.reason = reason;
+    event.result = event.event_type;
+    planner_event_pub_->publish(event);
+    planner_idle_ack_published_ = true;
+    RCLCPP_INFO(
+      get_logger(), "FRONTIER_QUERY_IDLE_ACK reason=%s", reason);
+  }
+
   void coordinator_status_cb(
     my_epuck_interfaces::msg::DistributedExplorationStatus::ConstSharedPtr message)
   {
@@ -1084,6 +1131,37 @@ private:
       return;
     }
     last_coordinator_state_ = message->state;
+    if (pause_planner_queries_while_navigating_) {
+      const bool navigation_active =
+        !message->terminal &&
+        (message->local_nav_goal_active ||
+        message->state == my_epuck_interfaces::msg::DistributedExplorationStatus::NAVIGATING);
+      const bool was_paused = navigation_paused_.exchange(navigation_active);
+      if (navigation_active && !was_paused) {
+        planner_idle_ack_published_ = false;
+        cancel_retry_timer();
+        RCLCPP_INFO(
+          get_logger(),
+          "FRONTIER_QUERY_PAUSED reason=NAVIGATION_ACTIVE state=%s",
+          coordinator_state_name(message->state));
+        if (active_request_.load() == 0 && !active_) {
+          state_ = State::IDLE;
+          publish_planner_idle_ack("NO_ACTIVE_QUERY");
+        } else {
+          RCLCPP_INFO(
+            get_logger(),
+            "FRONTIER_QUERY_PAUSE_WAITING_FOR_ACTIVE_REQUEST request_id=%lu",
+            active_request_.load());
+        }
+      } else if (!navigation_active && was_paused) {
+        planner_idle_ack_published_ = false;
+        RCLCPP_INFO(
+          get_logger(), "FRONTIER_QUERY_RESUMED reason=NAVIGATION_TERMINAL");
+      }
+    }
+    if (!event_driven_costing_) {
+      return;
+    }
     if (message->state == my_epuck_interfaces::msg::DistributedExplorationStatus::NAVIGATING) {
       RCLCPP_INFO(
         get_logger(),
@@ -1313,28 +1391,12 @@ private:
     if (!map || !costmap) {
       return;
     }
-    std::vector<Work> valid;
-    valid.reserve(reachable_.size());
-    for (const auto & work : reachable_) {
-      if (work_context_matches_snapshot(work, map, costmap)) {
-        valid.push_back(work);
-      } else {
-        const auto cache = evaluation_cache_.find(work.id);
-        const int64_t accepted_ns = cache == evaluation_cache_.end() ? 0 :
-          cache->second.last_query_ns;
-        const int64_t current_ns = now().nanoseconds();
-        const int64_t accepted_age_ns = current_ns - accepted_ns;
-        const bool accepted_recently = accepted_ns > 0 && accepted_age_ns >= 0 &&
-          std::chrono::duration<double>(std::chrono::nanoseconds(accepted_age_ns)) <=
-          kLocalContextTolerance;
-        if (accepted_recently) {
-          valid.push_back(work);
-        } else {
-          reject_stale_work(
-            work, cycle_revision_, map_revision, cycle_cost_revision_, costmap_revision);
-        }
-      }
-    }
+    // A successful planner result remains a valid candidate even when the
+    // rolling map/costmap advances while the batch is being completed.  The
+    // planner checked the path at query time; NavigateToPose replans against
+    // current data and RPP performs live collision checking during motion.
+    // Only request-generation/state guards discard obsolete callbacks.
+    auto valid = reachable_;
     reachable_.swap(valid);
     cycle_map_ = map;
     cycle_cost_ = costmap;
@@ -1730,6 +1792,15 @@ private:
   {
     log_query_boundary("SEND_NEXT_ENTER");
     QueryBoundaryScope boundary(this, "SEND_NEXT_EXIT");
+    if (navigation_paused_) {
+      RCLCPP_INFO(
+        get_logger(), "FRONTIER_QUERY_SUPPRESSED reason=NAVIGATION_ACTIVE");
+      if (active_request_.load() == 0 && !active_) {
+        state_ = State::IDLE;
+        publish_planner_idle_ack("SEND_NEXT_SUPPRESSED");
+      }
+      return;
+    }
     TimingScope timing(this, TimingSection::QUERY_RESULT_PROCESSING, now().seconds());
     if (!costing_open()) {
       RCLCPP_INFO(
@@ -1851,28 +1922,6 @@ private:
           ++stale_results_;
           return;
         }
-        uint64_t current_map, current_costmap;
-        {std::lock_guard<std::mutex> lock(mu_);
-          current_map = revision_;
-          current_costmap = cost_revision_;
-        }
-        const auto query_age = std::chrono::steady_clock::now() - request_started;
-        if (!work_context_matches_latest(candidate) && query_age > kLocalContextTolerance) {
-          cycle_termination_reason_ = "MAP_REVISION_CHANGED";
-          cycle_old_revision_ = revision;
-          cycle_new_revision_ = current_map;
-          cycle_old_cost_revision_ = cost_revision;
-          cycle_new_cost_revision_ = current_costmap;
-          if (handle) {planner_->async_cancel_goal(handle);}
-          ++stale_results_;
-          cancel_query_timeout_for(request);
-          ++request_generation_;
-          active_request_ = 0;
-          release_path_lock_for(request);
-          reject_stale_work(candidate, revision, current_map, cost_revision, current_costmap);
-          send_next();
-          return;
-        }
         if (!handle) {
           if (candidate.tier1_unqueried) {++cycle_tier1_aborted_;}
           set_region_status(candidate.id, "PLANNER_FAILED");
@@ -1899,6 +1948,11 @@ private:
           ++request_generation_;
           active_request_ = 0;
           release_path_lock_for(request);
+          if (navigation_paused_) {
+            state_ = State::IDLE;
+            publish_planner_idle_ack("GOAL_RESPONSE_REJECTED");
+            return;
+          }
           schedule_query_retry(1ms);
           return;
         }
@@ -1921,25 +1975,6 @@ private:
         }
         cancel_query_timeout_for(request);
         active_.reset();
-        active_request_ = 0;
-        uint64_t current_map, current_costmap;
-        {std::lock_guard<std::mutex> lock(mu_);
-          current_map = revision_;
-          current_costmap = cost_revision_;
-        }
-        const auto query_age = std::chrono::steady_clock::now() - request_started;
-        if (!work_context_matches_latest(candidate) && query_age > kLocalContextTolerance) {
-          cycle_termination_reason_ = "MAP_REVISION_CHANGED";
-          cycle_old_revision_ = revision;
-          cycle_new_revision_ = current_map;
-          cycle_old_cost_revision_ = cost_revision;
-          cycle_new_cost_revision_ = current_costmap;
-          ++stale_results_;
-          release_path_lock_for(request);
-          reject_stale_work(candidate, revision, current_map, cost_revision, current_costmap);
-          send_next();
-          return;
-        }
         const bool ok = result.code == rclcpp_action::ResultCode::SUCCEEDED && result.result &&
           result.result->error_code == Action::Result::NONE;
         const int error_code = result.result ? result.result->error_code : -1;
@@ -2022,7 +2057,31 @@ private:
               }
             }
           }
+          if (!stepback_rejected && path_valid_preflight_enabled_) {
+            // Validate the complete planner path, after the physical step-back
+            // endpoint has been applied, before reducing it to ROS candidate
+            // samples.  This is the only generator-side geometry admission
+            // gate; the allocator still receives the existing compact fields.
+            if (!effective_path.poses.empty()) {
+              effective_path.poses.back() = reachable.pose;
+            }
+            const auto service_path = effective_path;
+            request_path_validation(
+              service_path, request,
+              [this, candidate, result, revision, candidate_generation, duration,
+              callback_path = service_path,
+              effective_length, reachable = std::move(reachable)](
+                bool checked, bool valid, std::vector<int32_t> invalid_indices,
+                std::string reason) mutable {
+                finalize_path_candidate(
+                  candidate, result, revision, candidate_generation, duration,
+                  callback_path, effective_length, std::move(reachable), checked,
+                  valid, invalid_indices, reason);
+              });
+            return;
+          }
           if (!stepback_rejected) {
+            reachable.planned_path = effective_path;
             reachable.path = effective_length;
             if (selection_policy_ == "frontier_cost_only") {
               // Cost-only heading is the initial direction of the actual valid
@@ -2135,7 +2194,13 @@ private:
           ok ? "PATH_SUCCESS" : (hard ? "CANDIDATE_UNREACHABLE" :
           query_failure_class(result.code, error_code)), candidate_generation,
           error_code, nav2_error_name(error_code), duration);
+        active_request_ = 0;
         release_path_lock();
+        if (navigation_paused_) {
+          state_ = State::IDLE;
+          publish_planner_idle_ack("QUERY_DRAINED");
+          return;
+        }
         schedule_query_retry(1ms);
       };
     // The deadline belongs to the submitted request, not only to an accepted
@@ -2170,6 +2235,13 @@ private:
             candidate.query_event_id, candidate.id, request, reason,
             current_active_request, current_request_generation, timer_owner_request,
             static_cast<int>(state_.load()));
+          return;
+        }
+        if (navigation_paused_) {
+          RCLCPP_INFO(
+            get_logger(),
+            "FRONTIER_QUERY_WATCHDOG_DEFERRED request_id=%lu reason=NAVIGATION_ACTIVE",
+            request);
           return;
         }
         if (timer_owner_request != request) {
@@ -2247,6 +2319,188 @@ private:
     (void)goal_future;
     log_query_boundary(
       "ASYNC_SEND_GOAL_FUTURE_RECEIVED", request, candidate_generation, query_index_, queries_);
+  }
+
+  void request_path_validation(
+    const nav_msgs::msg::Path & path, uint64_t request,
+    std::function<void(bool, bool, std::vector<int32_t>, std::string)> callback)
+  {
+    if (!path_valid_preflight_enabled_) {
+      callback(false, true, {}, "DISABLED");
+      return;
+    }
+    if (!path_valid_client_ || !path_valid_client_->service_is_ready()) {
+      callback(false, false, {}, "PATH_VALID_SERVICE_UNAVAILABLE");
+      return;
+    }
+    auto request_message = std::make_shared<PathValid::Request>();
+    request_message->path = path;
+    std::function<void(rclcpp::Client<PathValid>::SharedFuture)> response_callback =
+      [this, request, callback = std::move(callback)](
+        rclcpp::Client<PathValid>::SharedFuture response_future) mutable {
+        if (request != active_request_ || request != request_generation_ ||
+          state_ != State::PATH_CHECKING)
+        {
+          return;
+        }
+        try {
+          const auto response = response_future.get();
+          std::vector<int32_t> invalid_indices(
+            response->invalid_pose_indices.begin(), response->invalid_pose_indices.end());
+          const bool valid = response->is_valid;
+          const std::string reason = valid ? "" : "NAV2_GLOBAL_PATH_INVALID";
+          RCLCPP_INFO(
+            get_logger(),
+            "PATH_VALIDATION_RESULT service=%s valid=%s invalid_pose_indices=%s reason=%s",
+            path_valid_service_.c_str(), valid ? "true" : "false",
+            invalid_indices_to_string(invalid_indices).c_str(), reason.c_str());
+          callback(true, valid, std::move(invalid_indices), reason);
+        } catch (const std::exception & error) {
+          RCLCPP_WARN(
+            get_logger(), "PATH_VALIDATION_RESULT service=%s valid=false reason=%s",
+            path_valid_service_.c_str(), error.what());
+          callback(false, false, {}, "PATH_VALID_SERVICE_ERROR");
+        }
+      };
+    auto future = path_valid_client_->async_send_request(request_message, response_callback);
+    (void)future;
+  }
+
+  static std::string invalid_indices_to_string(const std::vector<int32_t> & indices)
+  {
+    std::ostringstream output;
+    output << '[';
+    for (std::size_t i = 0; i < indices.size(); ++i) {
+      if (i) {output << ',';}
+      output << indices[i];
+    }
+    output << ']';
+    return output.str();
+  }
+
+  void finalize_path_candidate(
+    const Work & candidate, const GoalHandle::WrappedResult & result,
+    uint64_t revision, uint64_t candidate_generation, double duration,
+    const nav_msgs::msg::Path & effective_path, double effective_length,
+    Work reachable, bool validation_checked, bool path_valid,
+    const std::vector<int32_t> & invalid_indices, const std::string & validation_reason)
+  {
+    auto & cache = evaluation_cache_[candidate.id];
+    Work report_candidate = candidate;
+    std::optional<double> length;
+    if (!validation_checked) {
+      cache.has_work = false;
+      cache.map_context = candidate.map_context;
+      cache.cost_context = candidate.cost_context;
+      cache.path_map_context = candidate.path_map_context;
+      cache.path_cost_context = candidate.path_cost_context;
+      cache.last_query_ns = now().nanoseconds();
+      cache.cycles_not_queried = 0;
+      cache.classification = "PLANNER_FAILED";
+      cache.last_query_result = validation_reason;
+      set_region_status(candidate.id, "PLANNER_FAILED");
+      ++planner_failure_count_;
+    } else if (!path_valid) {
+      cache.has_work = false;
+      cache.map_context = candidate.map_context;
+      cache.cost_context = candidate.cost_context;
+      cache.path_map_context = candidate.path_map_context;
+      cache.path_cost_context = candidate.path_cost_context;
+      cache.last_query_ns = now().nanoseconds();
+      cache.cycles_not_queried = 0;
+      cache.classification = "UNREACHABLE_SAFE_APPROACH";
+      cache.last_query_result = validation_reason;
+      set_region_status(candidate.id, "UNREACHABLE_SAFE_APPROACH");
+      if (candidate.tier1_unqueried) {++cycle_tier1_unreachable_;}
+      count_classification("UNREACHABLE_SAFE_APPROACH");
+      suppress(candidate.id, revision, false);
+      RCLCPP_INFO(
+        get_logger(),
+        "FRONTIER_IS_PATH_VALID_REJECTED id=%lu invalid_pose_indices=%s reason=%s",
+        candidate.id, invalid_indices_to_string(invalid_indices).c_str(),
+        validation_reason.c_str());
+    } else {
+      reachable.planned_path = effective_path;
+      reachable.path = effective_length;
+      if (selection_policy_ == "frontier_cost_only") {
+        reachable.heading = path_initial_heading_cost(
+          effective_path, yaw_).value_or(0.0);
+      } else if (frontier_goal_stepback_m_ > 1e-9) {
+        const double final_yaw = orientation_yaw(reachable.pose.pose.orientation);
+        reachable.heading = std::abs(std::atan2(
+          std::sin(final_yaw - yaw_), std::cos(final_yaw - yaw_)));
+      }
+      const auto & poses = effective_path.poses;
+      const std::size_t count = std::min<std::size_t>(32, poses.size());
+      reachable.path_samples.clear();
+      reachable.path_samples.reserve(count);
+      for (std::size_t i = 0; i < count; ++i) {
+        const auto index = count < 2 ? 0 : std::llround(
+          static_cast<double>(i) * (poses.size() - 1) / (count - 1));
+        geometry_msgs::msg::Point point;
+        point.x = poses[index].pose.position.x;
+        point.y = poses[index].pose.position.y;
+        reachable.path_samples.push_back(point);
+      }
+      if (candidate.tier1_unqueried) {++cycle_tier1_reachable_;}
+      const auto diagnostic_length = path_length(
+        effective_path, rx_, ry_, reachable.pose.pose.position.x,
+        reachable.pose.pose.position.y, goal_tolerance_m_);
+      length = effective_length;
+      log_path_validation(
+        reachable, result, diagnostic_length, candidate_generation, duration,
+        &effective_path);
+      cache.work = reachable;
+      cache.has_work = true;
+      cache.map_context = reachable.map_context;
+      cache.cost_context = reachable.cost_context;
+      cache.path_map_context = reachable.path_map_context;
+      cache.path_cost_context = reachable.path_cost_context;
+      cache.last_query_ns = now().nanoseconds();
+      cache.cycles_not_queried = 0;
+      cache.classification = "REACHABLE";
+      set_region_status(candidate.id, "REACHABLE");
+      for (auto & diagnostic : region_diagnostics_) {
+        if (diagnostic.id == candidate.id) {
+          diagnostic.approach_x = reachable.pose.pose.position.x;
+          diagnostic.approach_y = reachable.pose.pose.position.y;
+          diagnostic.visible_reveal_gain = reachable.gain;
+          diagnostic.optimistic_cost_lower_bound_s =
+            std::max(0.0, reachable.euclid - goal_tolerance_m_) /
+            std::max(cost_only_reference_linear_speed_mps_, 1e-9);
+          diagnostic.has_approach = true;
+        }
+      }
+      report_candidate = reachable;
+      reachable_.push_back(std::move(reachable));
+    }
+    cache.last_query_result = cache.classification;
+    const auto result_failure_class = !validation_checked ?
+      "PATH_VALID_SERVICE_UNAVAILABLE" :
+      (!path_valid ? "NAV2_GLOBAL_PATH_INVALID" : "PATH_SUCCESS");
+    RCLCPP_INFO(
+      get_logger(),
+      "FRONTIER_QUERY_RESULT query_id=%lu id=%lu canonical_id=%016lx status=%s "
+      "action_result=%s failure_class=%s candidate_generation_id=%lu "
+      "target_x=%.9f target_y=%.9f target_yaw=%.9f goal_frame=%s error_code=%d "
+      "error_name=%s error_message=\"%s\" duration_s=%.3f path_length_m=%.6f",
+      report_candidate.query_event_id, report_candidate.id, report_candidate.id,
+      cache.classification.c_str(), action_result_name(result.code),
+      result_failure_class, candidate_generation,
+      report_candidate.pose.pose.position.x, report_candidate.pose.pose.position.y,
+      orientation_yaw(report_candidate.pose.pose.orientation),
+      report_candidate.pose.header.frame_id.c_str(),
+      result.result ? result.result->error_code : -1,
+      result.result ? nav2_error_name(result.result->error_code) : "NO_RESULT",
+      validation_reason.c_str(), duration, length.value_or(-1.0));
+    active_request_ = 0;
+    release_path_lock();
+    if (navigation_paused_) {
+      state_ = State::IDLE;
+      publish_planner_idle_ack("QUERY_DRAINED");
+      return;
+    }
+    schedule_query_retry(1ms);
   }
 
   void finish(bool publish = true)
@@ -2471,6 +2725,12 @@ private:
       if (!candidate_retry_callback_is_current(callback_generation, retry_generation_)) {
         return;
       }
+      if (navigation_paused_) {
+        RCLCPP_INFO(
+          get_logger(),
+          "FRONTIER_QUERY_SUPPRESSED reason=RETRY_NAVIGATION_ACTIVE");
+        return;
+      }
       if (!costing_open()) {
         RCLCPP_INFO(
           get_logger(),
@@ -2492,6 +2752,9 @@ private:
     const auto callback_generation = ++retry_generation_;
     retry_timer_ = create_wall_timer(std::chrono::milliseconds(delay_ms), [this, callback_generation] {
       if (!candidate_retry_callback_is_current(callback_generation, retry_generation_)) {
+        return;
+      }
+      if (navigation_paused_) {
         return;
       }
       if (retry_timer_) {
@@ -2839,6 +3102,7 @@ private:
       candidate.reachability_state = candidate.REACHABLE;
       candidate.local_path_length_m = work.path;
       candidate.local_path_samples = work.path_samples;
+      candidate.planned_path = work.planned_path;
       markers.markers.emplace_back();
       auto & marker = markers.markers.back();
       marker.header = message.header;
@@ -2964,6 +3228,7 @@ private:
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
   rclcpp_action::Client<Action>::SharedPtr planner_;
+  rclcpp::Client<PathValid>::SharedPtr path_valid_client_;
   GoalHandle::SharedPtr active_;
   rclcpp::TimerBase::SharedPtr timer_, timeout_timer_, retry_timer_, receipt_summary_timer_;
   std::mutex timeout_timer_mu_;
@@ -2974,10 +3239,12 @@ private:
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_, cost_sub_;
   rclcpp::Publisher<my_epuck_interfaces::msg::FrontierCandidateArray>::SharedPtr pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
+  rclcpp::Publisher<my_epuck_interfaces::msg::DistributedExplorationEvent>::SharedPtr
+    planner_event_pub_;
   int path_lock_fd_{-1};
   std::string robot_id_, map_topic_, global_costmap_topic_, global_frame_, robot_base_frame_;
-  std::string compute_path_action_, candidate_topic_, marker_topic_, path_query_lock_path_,
-    path_priority_path_;
+  std::string compute_path_action_, path_valid_service_, candidate_topic_, marker_topic_,
+    path_query_lock_path_, path_priority_path_;
   std::string grid_subscription_reliability_, grid_subscription_durability_;
   std::string planner_id_;
   std::string selection_policy_;
@@ -2985,7 +3252,9 @@ private:
   bool handoff_gated_{false};
   bool stop_after_handoff_{false};
   bool event_driven_costing_{false};
+  bool pause_planner_queries_while_navigating_{false};
   bool require_known_approach_{false};
+  bool path_valid_preflight_enabled_{false};
   bool processing_active_{false};
   bool status_gate_seen_{false};
   bool last_costing_request_{false};
@@ -2994,6 +3263,8 @@ private:
   uint64_t costing_epoch_id_{0};
   double last_alternative_request_time_s_{-1.0};
   uint8_t last_coordinator_state_{0};
+  std::atomic_bool navigation_paused_{false};
+  bool planner_idle_ack_published_{false};
   double approach_clearance_m_, frontier_goal_stepback_m_, planner_tolerance_m_, minimum_robot_distance_m_;
   double path_query_timeout_s_, gain_weight_, distance_weight_;
   double path_weight_, heading_weight_, unreachable_suppression_s_, goal_tolerance_m_;

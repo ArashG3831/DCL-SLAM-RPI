@@ -33,14 +33,13 @@
       movement_time_allowance: 8.0
 
     goal_checker:
-      plugin: "nav2_controller::SimpleGoalChecker"
+      plugin: "nav2_controller::PositionGoalChecker"
       xy_goal_tolerance: 0.16
-      yaw_goal_tolerance: 0.70
       stateful: false
 
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      desired_linear_vel: 0.1650
+      desired_linear_vel: 0.165
       lookahead_dist: 0.20
       min_lookahead_dist: 0.20
       max_lookahead_dist: 0.30
@@ -48,12 +47,13 @@
       use_velocity_scaled_lookahead_dist: true
       use_regulated_linear_velocity_scaling: true
       regulated_linear_scaling_min_radius: 0.50
-      regulated_linear_scaling_min_speed: 0.026
+      regulated_linear_scaling_min_speed: 0.075
+      min_approach_linear_velocity: 0.075
       approach_velocity_scaling_dist: 0.45
-      use_rotate_to_heading: false
+      use_rotate_to_heading: true
       rotate_to_heading_min_angle: 0.785
-      rotate_to_heading_angular_vel: 0.35
-      max_angular_accel: 0.20
+      rotate_to_heading_angular_vel: 1.0
+      max_angular_accel: 1.00
       allow_reversing: false
       use_collision_detection: true
       transform_tolerance: 1.5
@@ -67,7 +67,9 @@
     planner_plugins: ["GridBased"]
 
     GridBased:
-      plugin: "nav2_navfn_planner::NavfnPlanner"
+      plugin: "nav2_smac_planner::SmacPlannerLattice"
+      lattice_filepath: "/home/robot1/nav2_ws/install/nav2_smac_planner/share/nav2_smac_planner/sample_primitives/2cm_resolution/0.5m_turning_radius/diff/output.json"
+      smooth_path: false
       tolerance: 0.15
       use_astar: false
       allow_unknown: true
@@ -87,9 +89,9 @@
     robot_base_frame: robot2/base_link
     transform_tolerance: 2.0
     simulate_ahead_time: 2.0
-    max_rotational_vel: 0.55
-    min_rotational_vel: 0.20
-    rotational_acc_lim: 1.5
+    max_rotational_vel: 1.0
+    min_rotational_vel: 0.66
+    rotational_acc_lim: 1.00
 
     spin:
       plugin: "nav2_behaviors::Spin"
@@ -114,7 +116,7 @@
       height: 2
       resolution: 0.02
       footprint: "[[0.15, 0.07], [0.15, -0.07], [0.04, -0.07], [0.04, -0.12], [-0.03, -0.12], [-0.03, -0.07], [-0.03, 0.07], [-0.03, 0.12], [0.04, 0.12], [0.04, 0.07]]"
-      footprint_padding: 0.02
+      footprint_padding: 0.0
       always_send_full_costmap: true
       plugins: ["obstacle_layer", "inflation_layer"]
 
@@ -136,7 +138,7 @@
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         # Robot 2 solo test inflation radius.
-        inflation_radius: 0.1400
+        inflation_radius: 0.0000
         cost_scaling_factor: 1.1
 
 /robot2/global_costmap:
@@ -179,7 +181,7 @@
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         # Robot 2 solo test inflation radius.
-        inflation_radius: 0.1400
+        inflation_radius: 0.1600
         cost_scaling_factor: 1.1
 
 /robot2/lifecycle_manager_navigation:

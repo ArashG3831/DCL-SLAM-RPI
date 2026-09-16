@@ -2,20 +2,23 @@
 
 import hashlib
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
 import pytest
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, PoseStamped
 from my_epuck_interfaces.msg import (
     DistributedExplorationStatus,
     FrontierCandidate,
     FrontierCandidateArray,
 )
 from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import Path as NavPath
 
 from my_epuck_project.minimal_frontier_allocator import MinimalFrontierAllocator
+from my_epuck_project import minimal_frontier_navigation as navigation
 from my_epuck_project import minimal_frontier_termination as termination
 from my_epuck_project.mission_termination import CandidateEvidence, TerminalReason
 
@@ -78,6 +81,15 @@ def _candidate(frontier_id, length, centroid, approach):
     item.path_length_m = float(length)
     item.heading_change_rad = 0.0
     item.local_path_samples = [Point(x=0.0, y=0.0), Point(x=approach[0], y=approach[1])]
+    item.planned_path = NavPath()
+    item.planned_path.header.frame_id = 'robot2/map'
+    for x, y in ((0.0, 0.0), (approach[0] * 0.5, approach[1] * 0.5), approach):
+        pose = PoseStamped()
+        pose.header = item.planned_path.header
+        pose.pose.position.x = x
+        pose.pose.position.y = y
+        pose.pose.orientation.w = 1.0
+        item.planned_path.poses.append(pose)
     return item
 
 
@@ -123,6 +135,21 @@ def _allocator(local, *, dispatch=True):
     node._solo_pending_preflight = None
     node._solo_active_dispatch = None
     node._minimum_visible_gain_m = 0.05
+    node._solo_startup_spin_enabled = False
+    node._solo_startup_spin_angle_rad = 0.1745
+    node._solo_startup_spin_started = False
+    node._solo_startup_spin_finished = False
+    node._solo_startup_spin_succeeded = False
+    node._solo_startup_spin_active = False
+    node._solo_startup_spin_waiting_for_snapshot = False
+    node._solo_startup_spin_baseline_stamp_ns = 0
+    node._solo_startup_spin_baseline_generation_id = 0
+    node._solo_startup_spin_client = None
+    node._solo_follow_path_client = SimpleNamespace(
+        server_is_ready=lambda: True)
+    node._solo_follow_path_goal_handle = None
+    node._solo_follow_path_callback = None
+    node._solo_follow_path_cancel_requested = False
     node._candidates = {'robot1': None, 'robot2': local}
     node._evidence = {'robot1': node._make_evidence(FrontierCandidateArray()),
                       'robot2': node._make_evidence(local)}
@@ -247,18 +274,67 @@ def test_solo_dispatch_uses_candidate_path_without_second_planner_or_is_path_val
                 navigation_readiness_only=True,
             ))
 
-        def send_navigation(self, task, callback, diagnostic_path=()):
+        def send_follow_path(self, task, callback):
             self.sent_task = task
-            self.sent_path = diagnostic_path
+            self.sent_path = task.planned_path
             return True
 
     node._nav = _Nav()
+    node._send_solo_follow_path = node._nav.send_follow_path
     node._dispatch(candidate, tuple(candidate.local_path_samples))
 
     assert node._nav.readiness_calls == 1
     assert node._nav.sent_task.approach == (1.0, 2.0)
-    assert tuple((point.x, point.y) for point in node._nav.sent_path) == (
-        (0.0, 0.0), (1.0, 2.0))
+    assert node._nav.sent_path is candidate.planned_path
+
+
+def test_solo_follow_path_goal_receives_exact_full_planner_path():
+    candidate = _candidate(11, 0.6, (3.0, 4.0), (1.0, 2.0))
+    node = _allocator(_array('robot2', [candidate]))
+    node._nav = SimpleNamespace(travelled_distance_m=0.0)
+
+    class _Future:
+        def add_done_callback(self, callback):
+            self.callback = callback
+
+    class _FollowClient:
+        def __init__(self):
+            self.goals = []
+
+        def server_is_ready(self):
+            return True
+
+        def send_goal_async(self, goal):
+            self.goals.append(goal)
+            return _Future()
+
+    client = _FollowClient()
+    node._solo_follow_path_client = client
+    task = replace(
+        navigation.to_physical_task(candidate, 'robot2'),
+        planned_path=candidate.planned_path,
+    )
+
+    assert node._send_solo_follow_path(task, lambda _outcome: None)
+    assert len(client.goals) == 1
+    goal = client.goals[0]
+    assert goal.controller_id == 'FollowPath'
+    assert goal.goal_checker_id == 'goal_checker'
+    assert goal.progress_checker_id == 'progress_checker'
+    assert goal.path.header.frame_id == candidate.planned_path.header.frame_id
+    assert len(goal.path.poses) == len(candidate.planned_path.poses)
+    for actual, expected in zip(goal.path.poses, candidate.planned_path.poses):
+        assert actual.pose.position.x == expected.pose.position.x
+        assert actual.pose.position.y == expected.pose.position.y
+
+
+def test_solo_allocator_has_no_planner_query_or_navigate_to_pose_dispatch():
+    source = Path(
+        '/home/robot1/webots_ws/src/my_epuck_project/my_epuck_project/'
+        'minimal_frontier_allocator.py').read_text(encoding='utf-8')
+    assert 'ComputePathToPose' not in source
+    assert 'NavigateToPose' not in source
+    assert 'FollowPath' in source
 
 
 class _SoloReadinessNav:
@@ -286,8 +362,8 @@ class _SoloReadinessNav:
     def preflight_inputs_available(self):
         return True
 
-    def send_navigation(self, task, callback, diagnostic_path=()):
-        self.sent.append((task, diagnostic_path))
+    def send_follow_path(self, task, callback):
+        self.sent.append((task, task.planned_path))
         return True
 
 
@@ -308,6 +384,7 @@ def _real_dispatch(node):
     node._dispatch = MinimalFrontierAllocator._dispatch.__get__(
         node, MinimalFrontierAllocator,
     )
+    node._send_solo_follow_path = node._nav.send_follow_path
 
 
 def test_solo_geometry_is_not_rechecked_by_allocator():
@@ -736,3 +813,92 @@ def test_solo_branch_is_opt_in_and_launch_selects_only_minimal_allocator():
     assert 'executable="minimal_frontier_allocator"' in launch
     assert 'executable="distributed_frontier_assignment"' not in launch
     assert 'executable="frontier_explorer"' not in launch
+    assert '"solo_startup_spin_enabled": True' in launch
+    assert '"solo_startup_spin_angle_rad": 0.1745' in launch
+
+
+def test_solo_startup_spin_is_one_shot_and_waits_for_updated_snapshot():
+    candidate = _candidate(11, 0.6, (3.0, 4.0), (1.0, 2.0))
+    message = _array('robot2', [candidate], generation=1)
+    node = _allocator(message)
+    node._solo_startup_spin_enabled = True
+    node._nav = SimpleNamespace(health_flags=lambda: (True, True))
+    node._publish_status = lambda: None
+
+    class _Future:
+        def __init__(self):
+            self.callback = None
+
+        def add_done_callback(self, callback):
+            self.callback = callback
+
+    class _SpinClient:
+        def __init__(self):
+            self.goals = []
+            self.future = _Future()
+
+        def server_is_ready(self):
+            return True
+
+        def send_goal_async(self, goal):
+            self.goals.append(goal)
+            return self.future
+
+    client = _SpinClient()
+    node._solo_startup_spin_client = client
+
+    assert node._solo_startup_spin_ready_for_snapshot(message) is False
+    assert len(client.goals) == 1
+    assert client.goals[0].target_yaw == pytest.approx(0.1745)
+    assert node._solo_startup_spin_ready_for_snapshot(message) is False
+    assert len(client.goals) == 1
+
+    node._finish_solo_startup_spin(True, 'solo startup spin succeeded')
+    assert node._solo_startup_spin_ready_for_snapshot(message) is False
+    updated = _array('robot2', [candidate], generation=2)
+    assert node._solo_startup_spin_ready_for_snapshot(updated) is True
+
+
+def test_solo_startup_spin_starts_from_tick_without_candidates():
+    """The bootstrap spin must not depend on a candidate already existing."""
+    node = _allocator(_array('robot2', []))
+    node._candidates['robot2'] = None
+    node._solo_startup_spin_enabled = True
+    node._nav = SimpleNamespace(health_flags=lambda: (True, True))
+    node._publish_status = lambda: None
+    node._update_peer_presence = lambda: None
+    node._maybe_solo_terminal = lambda: None
+    node._maybe_terminal = lambda: None
+
+    class _Future:
+        def add_done_callback(self, callback):
+            self.callback = callback
+
+    class _SpinClient:
+        def __init__(self):
+            self.goals = []
+
+        def server_is_ready(self):
+            return True
+
+        def send_goal_async(self, goal):
+            self.goals.append(goal)
+            return _Future()
+
+    client = _SpinClient()
+    node._solo_startup_spin_client = client
+
+    node._tick()
+
+    assert len(client.goals) == 1
+    assert client.goals[0].target_yaw == pytest.approx(0.1745)
+    assert node._solo_startup_spin_started is True
+
+
+def test_dispatch_disabled_bypasses_startup_spin():
+    candidate = _candidate(11, 0.6, (3.0, 4.0), (1.0, 2.0))
+    node = _allocator(_array('robot2', [candidate]), dispatch=False)
+    node._solo_startup_spin_enabled = True
+    assert node._solo_startup_spin_ready_for_snapshot(
+        node._candidates['robot2']) is True
+    assert node._solo_startup_spin_started is False

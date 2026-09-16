@@ -1,3 +1,43 @@
+
+## Persisted user directive: read-only latest-artifact Smac investigation
+
+look dumbass. even with a crazy detailed 0.5cm local map, rpp was still not happy. very barely. until last second that it ACTUALLY HIT A WALL VERY SLIGHTLY. BEFORE RPP STOPPED IT. SO THERE IS A SERIOUS ISSUE WITH SMAC NOT DOING ITS JOB PROPERLY. INSPECT THE LATEST ARTIFACTS. DO NOT COME BACK UNTIL YOU HAVE A CONCRETE ANSWER. keep this read only. look up online when needed. spawn subagents set to luna high to even do deeper read only investigations for you. NO THE WALL DIDNT APPEAR OUT OF NO WHERE. THAT. IS. NOT. THE. ANSWER!!! BY THE END, I NEED A CONCRETE FINAL ANSWER ON WHY IT CHOOSES WRONG PATHS. logs: "arash@DESKTOP-OVP2LHB:~$ ~/robot2_visual
+remote_runner=179941
+[WARN] [1789512365.026967956] [rcl]: ROS_LOCALHOST_ONLY is deprecated but still honored if it is enabled. Use ROS_AUTOMATIC_DISCOVERY_RANGE and ROS_STATIC_PEERS instead.
+[WARN] [1789512365.026997956] [rcl]: ROS_LOCALHOST_ONLY is deprecated but still honored if it is enabled. Use ROS_AUTOMATIC_DISCOVERY_RANGE and ROS_STATIC_PEERS instead.
+[   0.1s] LIVE_REPORTER connected (read-only)
+Robot 2 custom-frontier minimal-allocator run is remote and remains alive after RViz closes.
+Use ~/robot2_stop for the explicit remote stop.
+[  16.5s] FRONTIERS remaining=11 reachable=1
+[  16.6s] STATUS bidding: solo startup spin active
+[  17.1s] STATUS bidding: solo startup spin succeeded
+[  17.2s] STATUS bidding: solo startup spin complete; updated snapshot received
+[  17.2s] GOAL selected: id=11612572061505354901 approach=(0.158,-0.881) cost=2.643 path=2.643m
+[  17.2s] GOAL navigating: id=11612572061505354901
+[  25.0s] STATUS bidding: goal failure
+[  30.1s] FRONTIERS remaining=0 reachable=1
+[  30.2s] GOAL selected: id=15129409959263670948 approach=(-0.964,-0.318) cost=1.560 path=1.560m
+[  30.2s] GOAL navigating: id=15129409959263670948
+[  39.6s] STATUS bidding: goal failure
+[  42.0s] FRONTIERS remaining=0 reachable=1
+[  42.1s] GOAL selected: id=3113138530945688887 approach=(-1.003,0.186) cost=1.506 path=1.506m
+[  42.1s] GOAL navigating: id=3113138530945688887
+[  52.5s] STATUS bidding: goal success
+[  56.2s] FRONTIERS remaining=11 reachable=1
+[  56.2s] GOAL selected: id=125004559581254698 approach=(1.415,-0.429) cost=3.091 path=3.091m
+[  56.2s] GOAL navigating: id=125004559581254698
+[  62.1s] STATUS bidding: goal failure
+[  67.5s] STATUS bidding: goal failure
+[  71.1s] STATUS bidding: goal failure
+[  71.5s] FRONTIERS remaining=1 reachable=0
+[  71.5s] STATUS waiting: no eligible solo candidate after preflight
+[  72.4s] STATUS waiting: IDLE
+[  72.4s] STATUS waiting: no eligible solo candidate after preflight
+[  74.3s] STATUS waiting: IDLE
+[  74.3s] STATUS waiting: no eligible solo candidate after preflight
+[  76.3s] STATUS waiting: IDLE
+[  76.5s] STATUS complete: MISSION_COMPLETE_NO_REACHABLE_FRONTIERS"
+
 # Robot 2 Project Guide for Coding Agents
 
 minimal_frontier_allocator is the only true decentralized task allocator, all

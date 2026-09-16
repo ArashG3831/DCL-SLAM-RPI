@@ -445,7 +445,7 @@ class CooperativeExperimentLogger(Node):
             'missing': [],
         }
         self.robot_counts={r:Counter() for r in self.robots}; self.cycle_durations={r:[] for r in self.robots}; self.cycle_starts={}; self.region_attempts={r:Counter() for r in self.robots}; self.exhausted_since={r:None for r in self.robots}; self.exhausted_duration={r:0. for r in self.robots}; self.mission_completion_time=None; self.mission_terminal_reason=''; self.statuses={}
-        self.files=[]; self.events=open(self.directory/'events.jsonl','a',encoding='utf-8',buffering=1); self.goal_decisions=open(self.directory/'goal_decision_ledger.jsonl','a',encoding='utf-8',buffering=1); self.files.append(self.goal_decisions); self.nav2_diagnostics=open(self.directory/'nav2_diagnostics.jsonl','a',encoding='utf-8',buffering=1); self.files.append(self.nav2_diagnostics); self.rosout_receipt_file=None; self._rosout_receipt_sequence=0; self.map_receipt_file=None; self._map_receipt_sequence=0; self.coverage_request_file=None; self.coverage_stream=None; self.frontier_regions_file=None; self.nav2_diagnostic_count=0; self._diagnostic_last={}; self.action_goal_states={}; self.warns=WarningDeduplicator(); self._deferred_warning_records=None; self._navigation_action_replay_failed=False; self.counts=Counter(); self.last={}; self.windows={}; self.stale={}; self.latest={r:{} for r in self.robots}; self.claims={}; self.distributed_last={}; self.frontier_metadata={r:{} for r in self.robots}; self.frontier_query_pending={}; self.frontier_query_forensics=bool(self.p.get('diagnostic_frontier_capture',False)); self.frontier_query_forensic_file=None; self.frontier_query_tf_file=None; self.frontier_query_crops={}
+        self.files=[]; self.events=open(self.directory/'events.jsonl','a',encoding='utf-8',buffering=1); self.goal_decisions=open(self.directory/'goal_decision_ledger.jsonl','a',encoding='utf-8',buffering=1); self.files.append(self.goal_decisions); self.nav2_diagnostics=open(self.directory/'nav2_diagnostics.jsonl','a',encoding='utf-8',buffering=1); self.files.append(self.nav2_diagnostics); self.rosout_receipt_file=None; self._rosout_receipt_sequence=0; self.map_receipt_file=None; self._map_receipt_sequence=0; self.coverage_request_file=None; self.coverage_stream=None; self.frontier_regions_file=None; self.nav2_diagnostic_count=0; self._diagnostic_last={}; self.action_goal_states={}; self.follow_path_goal_lifecycle=set(); self.follow_path_terminal_pending=Counter(); self.warns=WarningDeduplicator(); self._deferred_warning_records=None; self._navigation_action_replay_failed=False; self.counts=Counter(); self.last={}; self.windows={}; self.stale={}; self.latest={r:{} for r in self.robots}; self.claims={}; self.distributed_last={}; self.frontier_metadata={r:{} for r in self.robots}; self.frontier_query_pending={}; self.frontier_query_forensics=bool(self.p.get('diagnostic_frontier_capture',False)); self.frontier_query_forensic_file=None; self.frontier_query_tf_file=None; self.frontier_query_crops={}
         if bool(self.p.get('enable_scientific_raw_capture', False)):
             self.rosout_receipt_file=open(
                 self.directory / 'rosout_receipts.jsonl', 'a',
@@ -2153,17 +2153,18 @@ class CooperativeExperimentLogger(Node):
         with self._state_lock:
             self.sequence+=1; sequence=self.sequence
         sec,nsec=source_stamp or self.ros_now(); return {'schema_version':SCHEMA,'run_id':self.run_id,'event_sequence':sequence,'wall_time_utc':utc_now(),'ros_time_sec':sec,'ros_time_nanosec':nsec,'elapsed_s':self.ros_seconds()-self.start_ros,'wall_elapsed_s':time.monotonic()-self.start,'robot_id':robot,'source':source}
-    def event(self,event_type,message,robot=None,source='/cooperative_experiment_logger',severity='INFO',source_stamp=None,console=False,allow_during_shutdown=False,**extra):
+    def event(self,event_type,message,robot=None,source='/cooperative_experiment_logger',severity='INFO',source_stamp=None,console=False,allow_during_shutdown=False,write_goal_ledger=True,count_event=True,**extra):
         if (self._finalizing or self._closed) and not allow_during_shutdown:return None
         row=self.common(source,robot,source_stamp); row.update(severity=severity,event_type=event_type,message=message); row.update(finite(extra))
-        with self._state_lock:self.counts[event_type]+=1
+        if count_event:
+            with self._state_lock:self.counts[event_type]+=1
         self._account_goal_event(row)
         try:
             encoded=json.dumps(finite(row),separators=(',',':'),allow_nan=False)+'\n'
             with self._io_lock:
                 if self._closed:return None
                 self.events.write(encoded)
-                if event_type in GOAL_LEDGER_EVENTS:
+                if write_goal_ledger and event_type in GOAL_LEDGER_EVENTS:
                     ledger = dict(row)
                     ledger['decision_stage'] = event_type
                     ledger['observed_navigation_active'] = bool(
@@ -2503,11 +2504,40 @@ class CooperativeExperimentLogger(Node):
             value=int(status.status); key=(r,action,goal_id); previous=self.action_goal_states.get(key)
             if previous==value: continue
             self.action_goal_states[key]=value
+            source=f'/{r}/{action.lower()}/_action/status'
+            status_name=names.get(value,str(value))
+            fields=dict(action=action, goal_uuid=goal_id,
+                        status_value=value, status_name=status_name)
             self.event(f'{action}_STATUS', 'action goal status changed', r,
-                       f'/{r}/{action.lower()}/_action/status',
-                       source_stamp=stamp(msg), action=action,
-                       goal_uuid=goal_id, status_value=value,
-                       status_name=names.get(value,str(value)))
+                       source, source_stamp=stamp(msg), **fields)
+            if action != 'FOLLOW_PATH':
+                continue
+            # FollowPath is the physical solo allocator's navigation action.
+            # Convert its passive status stream into the same goal ledger
+            # lifecycle used by NavigateToPose/legacy claim reporting.
+            lifecycle_key=(r, goal_id)
+            if value in (1, 2):
+                self.latest[r]['navigation_active']=True
+                if lifecycle_key not in self.follow_path_goal_lifecycle:
+                    self.follow_path_goal_lifecycle.add(lifecycle_key)
+                    self.event('NAV_GOAL_SENT',
+                               'FollowPath goal observed', r, source,
+                               source_stamp=stamp(msg), **fields)
+                    self.event('NAV_GOAL_ACCEPTED',
+                               'FollowPath goal accepted', r, source,
+                               source_stamp=stamp(msg), **fields)
+            elif value in (4, 5, 6):
+                self.latest[r]['navigation_active']=False
+                terminal_kind={4:'NAVIGATION_SUCCEEDED',
+                               5:'NAVIGATION_CANCELED',
+                               6:'NAVIGATION_FAILED'}[value]
+                self.follow_path_terminal_pending[r] += 1
+                self.event(terminal_kind,
+                           f'FollowPath terminal status: {status_name}',
+                           r, source, source_stamp=stamp(msg),
+                           severity='ERROR' if value == 6 else 'INFO',
+                           failure_class='CONTROLLER_FAILURE' if value == 6 else None,
+                           **fields)
     def candidates(self,r,msg):
         old=self.latest[r].get('candidate_count'); count=len(msg.candidates); self.mark(r,'frontier_candidates',msg); self.latest[r]['candidate_count']=count
         # Keep the observer passive, but retain the bounded candidate evidence
@@ -2652,8 +2682,19 @@ class CooperativeExperimentLogger(Node):
                       nav2_error_code=msg.nav2_error_code,
                       nav2_error_message=msg.nav2_error_message)
         source = f'/{r}/distributed_event'
+        duplicate_follow_path_terminal = (
+            msg.event_type in {
+                'NAVIGATION_SUCCEEDED', 'NAVIGATION_FAILED',
+                'NAVIGATION_CANCELED', 'NAVIGATION_CANCELLED',
+                'NAVIGATION_TIMEOUT',
+            } and self.follow_path_terminal_pending.get(r, 0) > 0)
+        if duplicate_follow_path_terminal:
+            self.follow_path_terminal_pending[r] -= 1
         self.event(msg.event_type, msg.reason, r, source,
-                   source_stamp=stamp(msg), **fields)
+                   source_stamp=stamp(msg),
+                   write_goal_ledger=not duplicate_follow_path_terminal,
+                   count_event=not duplicate_follow_path_terminal,
+                   **fields)
         # The replicated executor reports the local action acceptance as a
         # state-transition event rather than using the legacy claim topic.
         # Normalize that protocol event so navigation telemetry retains the
