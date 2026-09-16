@@ -29,6 +29,10 @@ setup(
             'twist_stamper = my_epuck_project.twist_stamper:main',
             'map_exporter = my_epuck_project.map_exporter:main',
             'source_aware_map_fusion = my_epuck_project.source_aware_map_fusion:main',
+            'unknown_pose_frontend = '
+            'my_epuck_project.unknown_pose_frontend:main',
+            'unknown_pose_validation_observer = '
+            'my_epuck_project.unknown_pose_validation_observer:main',
             'frontier_proposal_adapter = '
             'my_epuck_project.frontier_proposal_adapter:main',
             'distributed_frontier_assignment = '
